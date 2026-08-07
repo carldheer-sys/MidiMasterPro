@@ -1,0 +1,869 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import * as Tone from 'tone'
+import { Undo2, Redo2, Trash2, ChevronDown, ChevronRight, Download, Upload } from 'lucide-react'
+import PianoRoll from './components/PianoRoll'
+import TransportBar from './components/TransportBar'
+import { Button } from './components/ui/button'
+import { Select } from './components/ui/select'
+import { Input } from './components/ui/input'
+import { Label } from './components/ui/label'
+import { KEYS, MODES, TIME_SIGNATURE_PRESETS, TIME_DIVISIONS } from './constants'
+import audioEngine from './lib/audioEngine'
+import { analyzeAnnotations } from './lib/annotations'
+import { exportToMidi, importFromMidi, beatsPerBarFromTimeSignature, beatsPerDivisionFromTimeDivision, normalizeTimeSignature } from './lib/midiUtils'
+import { renderTracksToWav } from './lib/audioExport'
+import { exportToMusicXml } from './lib/musicXmlExport'
+import { saveBlob } from './lib/fileSave'
+import { noteToMidi, midiToNote, canonicalizeNoteName, getKeyPreferredNaming, generateId } from './lib/musicUtils'
+import { useMIDIInput } from './hooks/useMIDIInput'
+
+const TREBLE_RANGE = { lowestMidi: 48, highestMidi: 84 } // C3 to C6
+const BASS_RANGE = { lowestMidi: 24, highestMidi: 60 }  // C1 to C4
+
+function makeInitialTrack(id, name, config) {
+  return {
+    id,
+    name,
+    notes: [],
+    lowestMidi: config.lowestMidi,
+    highestMidi: config.highestMidi,
+  }
+}
+
+export default function App() {
+  // ─── Transport state ────────────────────────────────────────────────────────
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [isRecording, setIsRecording] = useState(false)
+  const [isCountingDown, setIsCountingDown] = useState(false)
+  const [isLooping, setIsLooping] = useState(false)
+  const [metronomeEnabled, setMetronomeEnabled] = useState(false)
+  const [cursorPosition, setCursorPosition] = useState(0)
+  const [audioStarted, setAudioStarted] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
+
+  // ─── Project settings ──────────────────────────────────────────────────────
+  const [tempo, setTempo] = useState(120)
+  const [selectedKey, setSelectedKey] = useState('C')
+  const [mode, setMode] = useState('Major')
+  const [bars, setBars] = useState(4)
+  const [timeSignature, setTimeSignature] = useState({ numerator: 4, denominator: 4 })
+  const [timeDivision, setTimeDivision] = useState('1/4')
+  const [annotationType, setAnnotationType] = useState('none')
+  const [snapToGrid, setSnapToGrid] = useState(false)
+  const [workspaceZoom, setWorkspaceZoom] = useState(1)
+
+  // ─── Tracks ────────────────────────────────────────────────────────────────
+  const [tracks, setTracks] = useState([
+    makeInitialTrack('treble', 'Treble', TREBLE_RANGE),
+    makeInitialTrack('bass', 'Bass', BASS_RANGE),
+  ])
+  const [activeTrackId, setActiveTrackId] = useState('treble')
+  const [activeMidiNotes, setActiveMidiNotes] = useState({})
+  const [collapsedTracks, setCollapsedTracks] = useState({})
+  const [isPasteMode, setIsPasteMode] = useState(false)
+  const [pasteTargetTrackId, setPasteTargetTrackId] = useState(null)
+
+  // ─── Undo/Redo ─────────────────────────────────────────────────────────────
+  const [history, setHistory] = useState([])
+  const [redoStack, setRedoStack] = useState([])
+
+  // ─── Refs ──────────────────────────────────────────────────────────────────
+  const tracksRef = useRef(tracks)
+  const isRecordingRef = useRef(isRecording)
+  const isCountingDownRef = useRef(isCountingDown)
+  const activeTrackIdRef = useRef(activeTrackId)
+  const activeMidiNotesRef = useRef(activeMidiNotes)
+  const cursorPositionRef = useRef(cursorPosition)
+  const playheadProgressRef = useRef(0)
+  const barsRef = useRef(bars)
+  const timeDivisionRef = useRef(timeDivision)
+  const timeSignatureRef = useRef(timeSignature)
+  const snapToGridRef = useRef(snapToGrid)
+  const namingRef = useRef('sharp')
+  const scrollSyncRef = useRef([])
+  const clipboardNotesRef = useRef(null)
+
+  useEffect(() => { tracksRef.current = tracks }, [tracks])
+  useEffect(() => { isRecordingRef.current = isRecording }, [isRecording])
+  useEffect(() => { isCountingDownRef.current = isCountingDown }, [isCountingDown])
+  useEffect(() => { activeTrackIdRef.current = activeTrackId }, [activeTrackId])
+  useEffect(() => { activeMidiNotesRef.current = activeMidiNotes }, [activeMidiNotes])
+  useEffect(() => { cursorPositionRef.current = cursorPosition }, [cursorPosition])
+  useEffect(() => { barsRef.current = bars }, [bars])
+  useEffect(() => { timeDivisionRef.current = timeDivision }, [timeDivision])
+  useEffect(() => { timeSignatureRef.current = timeSignature }, [timeSignature])
+  useEffect(() => { snapToGridRef.current = snapToGrid }, [snapToGrid])
+
+  const naming = useMemo(() => getKeyPreferredNaming(selectedKey, mode), [selectedKey, mode])
+  useEffect(() => { namingRef.current = naming }, [naming])
+
+  const beatsPerBar = useMemo(() => beatsPerBarFromTimeSignature(timeSignature), [timeSignature])
+
+  // ─── Audio engine init ─────────────────────────────────────────────────────
+  useEffect(() => {
+    const initAudio = async () => {
+      try {
+        await audioEngine.initialize(256)
+        audioEngine.onCursorUpdate = (pos) => setCursorPosition(pos)
+        audioEngine.onPlayheadUpdate = (progress) => { playheadProgressRef.current = progress }
+        audioEngine.onPlaybackComplete = () => {
+          setIsPlaying(false)
+          setIsRecording(false)
+          setCursorPosition(0)
+          commitPendingNotes()
+        }
+      } catch (err) {
+        console.error('Audio init failed:', err)
+      }
+    }
+    initAudio()
+    return () => { audioEngine.dispose() }
+  }, [])
+
+  // ─── Update engine settings ────────────────────────────────────────────────
+  useEffect(() => {
+    audioEngine.setTempo(tempo, timeSignature)
+    audioEngine.setTimeSignature(timeSignature)
+    audioEngine.setLoopLength(bars)
+    audioEngine.setLoopEnabled(isLooping, bars)
+  }, [tempo, timeSignature, bars, isLooping])
+
+  // ─── Annotations ───────────────────────────────────────────────────────────
+  const trebleAnnotations = useMemo(() => {
+    if (annotationType === 'none') return []
+    return analyzeAnnotations(tracks[0].notes, selectedKey, mode, annotationType)
+  }, [tracks[0].notes, selectedKey, mode, annotationType])
+
+  const bassAnnotations = useMemo(() => {
+    if (annotationType === 'none') return []
+    return analyzeAnnotations(tracks[1].notes, selectedKey, mode, annotationType)
+  }, [tracks[1].notes, selectedKey, mode, annotationType])
+
+  // ─── Note operations ───────────────────────────────────────────────────────
+  const saveHistory = useCallback(() => {
+    setHistory(prev => [...prev.slice(-49), { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
+    setRedoStack([])
+  }, [])
+
+  const updateTrack = useCallback((trackId, updater) => {
+    setTracks(prev => prev.map(t => {
+      if (t.id !== trackId) return t
+      const updated = typeof updater === 'function' ? updater(t) : { ...t, ...updater }
+      return updated
+    }))
+  }, [])
+
+  const handleNoteAdd = useCallback((trackId, noteName, start, duration) => {
+    saveHistory()
+    const naming = namingRef.current
+    const canonical = canonicalizeNoteName(noteName, naming)
+    const newNote = {
+      id: generateId(),
+      note: canonical,
+      start,
+      duration,
+      velocity: 0.8,
+    }
+    updateTrack(trackId, t => ({
+      ...t,
+      notes: [...t.notes.filter(n => {
+        // Remove overlapping notes on same pitch
+        if (n.note !== canonical) return true
+        const nEnd = n.start + n.duration
+        const newEnd = start + duration
+        return !(start < nEnd && newEnd > n.start)
+      }), newNote],
+    }))
+  }, [saveHistory, updateTrack])
+
+  const handleNoteUpdate = useCallback((trackId, noteId, updates) => {
+    updateTrack(trackId, t => ({
+      ...t,
+      notes: t.notes.map(n => n.id === noteId ? { ...n, ...updates } : n),
+    }))
+  }, [updateTrack])
+
+  const handleNotesUpdate = useCallback((trackId, updatesById) => {
+    updateTrack(trackId, t => ({
+      ...t,
+      notes: t.notes.map(n => {
+        const updates = updatesById[n.id]
+        return updates ? { ...n, ...updates } : n
+      }),
+    }))
+  }, [updateTrack])
+
+  const handleNoteDelete = useCallback((trackId, noteId) => {
+    saveHistory()
+    updateTrack(trackId, t => ({
+      ...t,
+      notes: t.notes.filter(n => n.id !== noteId),
+    }))
+  }, [saveHistory, updateTrack])
+
+  const handleNotesSelect = useCallback((trackId, noteIds, exclusive) => {
+    updateTrack(trackId, t => ({
+      ...t,
+      notes: t.notes.map(n => {
+        if (noteIds.includes(n.id)) {
+          return exclusive ? { ...n, selected: true } : { ...n, selected: !n.selected }
+        }
+        return exclusive ? { ...n, selected: false } : n
+      }),
+    }))
+  }, [updateTrack])
+
+  const handleNotePlay = useCallback(async (noteName) => {
+    if (!audioEngine.isInitialized) return
+    await audioEngine.startAudioContext()
+    const canonical = canonicalizeNoteName(noteName, namingRef.current)
+    audioEngine.playNote(canonical, '8n')
+  }, [])
+
+  // ─── Transport controls ────────────────────────────────────────────────────
+  const ensureAudioStarted = async () => {
+    if (!audioStarted) {
+      await audioEngine.startAudioContext()
+      setAudioStarted(true)
+    }
+  }
+
+  const scheduleAllNotes = useCallback(() => {
+    audioEngine.clearScheduledNotes()
+    for (const track of tracksRef.current) {
+      if (track.notes.length > 0) {
+        audioEngine.scheduleNotes(track.notes, timeDivisionRef.current, barsRef.current)
+      }
+    }
+  }, [])
+
+  const handlePlay = useCallback(async () => {
+    await ensureAudioStarted()
+    const newPlaying = !isPlaying
+    setIsPlaying(newPlaying)
+
+    if (newPlaying) {
+      setIsRecording(false)
+      setIsCountingDown(false)
+      setActiveMidiNotes({})
+      activeMidiNotesRef.current = {}
+      audioEngine.stopMetronome()
+      scheduleAllNotes()
+      if (metronomeEnabled) audioEngine.startMetronome()
+      await audioEngine.start()
+      if (!isLooping) audioEngine.scheduleStopEvent(bars)
+    } else {
+      audioEngine.pause()
+    }
+  }, [isPlaying, isLooping, bars, metronomeEnabled, scheduleAllNotes, audioStarted])
+
+  const handleStop = useCallback(() => {
+    setIsRecording(false)
+    setIsCountingDown(false)
+    setIsPlaying(false)
+    setActiveMidiNotes({})
+    activeMidiNotesRef.current = {}
+    audioEngine.stop()
+    audioEngine.stopMetronome()
+    audioEngine.clearScheduledNotes()
+    setCursorPosition(0)
+  }, [])
+
+  const handleRecord = useCallback(async () => {
+    await ensureAudioStarted()
+
+    if (isRecording) {
+      // Stop recording
+      audioEngine.stopMetronome()
+      audioEngine.stop()
+      audioEngine.clearScheduledNotes()
+      setIsRecording(false)
+      setIsCountingDown(false)
+      setActiveMidiNotes({})
+      activeMidiNotesRef.current = {}
+      return
+    }
+
+    setIsPlaying(false)
+    setIsRecording(true)
+    audioEngine.stop()
+    audioEngine.clearScheduledNotes()
+
+    if (metronomeEnabled) {
+      await audioEngine.startMetronome()
+    }
+    await audioEngine.start()
+    audioEngine.scheduleStopEvent(bars)
+  }, [isRecording, metronomeEnabled, bars, audioStarted])
+
+  // ─── MIDI input ────────────────────────────────────────────────────────────
+  const commitPendingNotes = useCallback(() => {
+    const maxDuration = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+    Object.keys(activeMidiNotesRef.current).forEach(id => {
+      const noteRecord = activeMidiNotesRef.current[id]
+      if (noteRecord) {
+        const commitTrackId = noteRecord.trackId || activeTrackIdRef.current
+        let finalStart = noteRecord.start
+        let duration = maxDuration - finalStart
+
+        if (snapToGridRef.current) {
+          const bpd = beatsPerDivisionFromTimeDivision(timeDivisionRef.current, timeSignatureRef.current)
+          finalStart = Math.round(finalStart / bpd) * bpd
+          duration = Math.round(duration / bpd) * bpd
+          if (duration < bpd) duration = bpd
+        }
+
+        if (finalStart >= maxDuration) return
+        if (finalStart + duration > maxDuration) {
+          duration = Math.max(0.1, maxDuration - finalStart)
+        }
+
+        handleNoteAdd(commitTrackId, noteRecord.note, finalStart, duration)
+      }
+    })
+    setActiveMidiNotes({})
+    activeMidiNotesRef.current = {}
+  }, [handleNoteAdd])
+
+  const handleMidiNoteOn = useCallback((midiNote, velocity) => {
+    const targetTrack = tracksRef.current.find(t => t.id === activeTrackIdRef.current) || tracksRef.current[0]
+    if (!targetTrack) return
+
+    const rawNoteName = Tone.Frequency(midiNote, 'midi').toNote()
+    const canonicalNote = canonicalizeNoteName(rawNoteName, namingRef.current)
+
+    // Determine which track based on pitch
+    let trackId = activeTrackIdRef.current
+    const midi = noteToMidi(canonicalNote)
+    if (midi !== null) {
+      if (midi >= 60 && trackId === 'bass') trackId = 'treble'
+      else if (midi < 60 && trackId === 'treble') trackId = 'bass'
+    }
+
+    const targetTrack2 = tracksRef.current.find(t => t.id === trackId) || targetTrack
+
+    audioEngine.startNote(canonicalNote, velocity / 127)
+
+    if (isRecordingRef.current && !isCountingDownRef.current) {
+      const currentBeat = Tone.Transport.ticks / Tone.Transport.PPQ
+      const noteId = generateId()
+      setActiveMidiNotes(prev => {
+        const updated = { ...prev, [noteId]: { note: canonicalNote, start: currentBeat, id: noteId, trackId } }
+        activeMidiNotesRef.current = updated
+        return updated
+      })
+    }
+  }, [])
+
+  const handleMidiNoteOff = useCallback((midiNote) => {
+    const rawNoteName = Tone.Frequency(midiNote, 'midi').toNote()
+    const canonicalNote = canonicalizeNoteName(rawNoteName, namingRef.current)
+
+    audioEngine.stopNote(canonicalNote)
+
+    if (isRecordingRef.current && !isCountingDownRef.current) {
+      const currentBeat = Tone.Transport.ticks / Tone.Transport.PPQ
+      const maxDuration = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+
+      // Find the active note for this pitch
+      const entries = Object.entries(activeMidiNotesRef.current)
+      for (const [id, record] of entries) {
+        if (record.note === canonicalNote) {
+          let finalStart = record.start
+          let duration = currentBeat - finalStart
+
+          if (snapToGridRef.current) {
+            const bpd = beatsPerDivisionFromTimeDivision(timeDivisionRef.current, timeSignatureRef.current)
+            finalStart = Math.round(finalStart / bpd) * bpd
+            duration = Math.round(duration / bpd) * bpd
+            if (duration < bpd) duration = bpd
+          } else {
+            if (duration < 0.1) duration = 0.1
+          }
+
+          if (finalStart >= maxDuration) {
+            setActiveMidiNotes(prev => {
+              const updated = { ...prev }
+              delete updated[id]
+              activeMidiNotesRef.current = updated
+              return updated
+            })
+            continue
+          }
+
+          if (finalStart + duration > maxDuration) {
+            duration = Math.max(0.1, maxDuration - finalStart)
+          }
+
+          handleNoteAdd(record.trackId || activeTrackIdRef.current, canonicalNote, finalStart, duration)
+
+          setActiveMidiNotes(prev => {
+            const updated = { ...prev }
+            delete updated[id]
+            activeMidiNotesRef.current = updated
+            return updated
+          })
+        }
+      }
+    }
+  }, [handleNoteAdd])
+
+  useMIDIInput(handleMidiNoteOn, handleMidiNoteOff)
+
+  // ─── Undo / Redo ───────────────────────────────────────────────────────────
+  const handleUndo = useCallback(() => {
+    setHistory(prev => {
+      if (prev.length === 0) return prev
+      const last = prev[prev.length - 1]
+      setRedoStack(r => [...r, { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
+      setTracks(last.tracks)
+      return prev.slice(0, -1)
+    })
+  }, [])
+
+  const handleRedo = useCallback(() => {
+    setRedoStack(prev => {
+      if (prev.length === 0) return prev
+      const next = prev[prev.length - 1]
+      setHistory(h => [...h, { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
+      setTracks(next.tracks)
+      return prev.slice(0, -1)
+    })
+  }, [])
+
+  // ─── Clear track ───────────────────────────────────────────────────────────
+  const handleClearTrack = useCallback((trackId) => {
+    saveHistory()
+    updateTrack(trackId, t => ({ ...t, notes: [] }))
+  }, [saveHistory, updateTrack])
+
+  // ─── Export / Import ───────────────────────────────────────────────────────
+  const handleExportMidi = useCallback(async () => {
+    try {
+      const blob = exportToMidi(tracks, tempo, timeDivision, timeSignature)
+      await saveBlob(blob, 'my_composition.mid', ['mid'], 'MIDI files')
+    } catch (err) {
+      console.error('MIDI export failed:', err)
+      alert('MIDI export failed: ' + err.message)
+    }
+  }, [tracks, tempo, timeDivision, timeSignature])
+
+  const handleExportWav = useCallback(async () => {
+    setIsExporting(true)
+    try {
+      const activeTracks = tracks.filter(t => t.notes.length > 0)
+      if (activeTracks.length === 0) {
+        alert('No notes to export.')
+        return
+      }
+      const blob = await renderTracksToWav(activeTracks, tempo, bars, timeSignature)
+      await saveBlob(blob, 'my_composition.wav', ['wav'], 'WAV audio')
+    } catch (err) {
+      console.error('WAV export failed:', err)
+      alert('WAV export failed: ' + err.message)
+    } finally {
+      setIsExporting(false)
+    }
+  }, [tracks, tempo, bars, timeSignature])
+
+  const handleExportXml = useCallback(async () => {
+    try {
+      const xml = exportToMusicXml({
+        trebleNotes: tracks[0].notes,
+        bassNotes: tracks[1].notes,
+        trebleAnnotations,
+        bassAnnotations,
+        annotationType,
+        key: selectedKey,
+        mode,
+        tempo,
+        timeSignature: normalizeTimeSignature(timeSignature),
+        bars,
+        title: 'My Composition',
+      })
+      const blob = new Blob([xml], { type: 'application/vnd.recordare.musicxml+xml' })
+      await saveBlob(blob, 'my_composition.musicxml', ['musicxml', 'xml'], 'MusicXML')
+    } catch (err) {
+      console.error('MusicXML export failed:', err)
+      alert('MusicXML export failed: ' + err.message)
+    }
+  }, [tracks, trebleAnnotations, bassAnnotations, annotationType, selectedKey, mode, tempo, timeSignature, bars])
+
+  const handleImportMidi = useCallback(async () => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.mid,.midi'
+    input.onchange = async (e) => {
+      const file = e.target.files[0]
+      if (!file) return
+      try {
+        const arrayBuffer = await file.arrayBuffer()
+        const result = await importFromMidi(arrayBuffer, tempo)
+
+        saveHistory()
+
+        // Distribute imported tracks to treble/bass based on pitch range
+        const newTracks = [...tracksRef.current]
+        if (result.tracks.length === 1) {
+          // Single track: split by pitch (MIDI >= 60 goes to treble, < 60 to bass)
+          const allNotes = result.tracks[0].notes
+          const trebleNotes = allNotes.filter(n => noteToMidi(n.note) >= 60)
+          const bassNotes = allNotes.filter(n => noteToMidi(n.note) < 60)
+          newTracks[0] = { ...newTracks[0], notes: trebleNotes }
+          newTracks[1] = { ...newTracks[1], notes: bassNotes }
+        } else {
+          // Multiple tracks: assign first to treble, second to bass
+          newTracks[0] = { ...newTracks[0], notes: result.tracks[0]?.notes || [] }
+          newTracks[1] = { ...newTracks[1], notes: result.tracks[1]?.notes || [] }
+        }
+
+        setTracks(newTracks)
+        if (result.bars) setBars(result.bars)
+        if (result.timeDivision) setTimeDivision(result.timeDivision)
+        if (result.timeSignature) setTimeSignature(result.timeSignature)
+        if (result.tempo) setTempo(result.tempo)
+      } catch (err) {
+        console.error('MIDI import failed:', err)
+        alert('MIDI import failed: ' + err.message)
+      }
+    }
+    input.click()
+  }, [tempo, saveHistory])
+
+  // ─── Keyboard shortcuts ────────────────────────────────────────────────────
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
+
+      const copySelectedToClipboard = () => {
+        const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current) || tracksRef.current[0]
+        if (!track) return false
+        const selected = (track.notes || []).filter(n => n.selected)
+        if (!selected.length) return false
+
+        const sortedSelection = [...selected].sort((a, b) => {
+          if (a.start !== b.start) return a.start - b.start
+          const aMidi = noteToMidi(a.note)
+          const bMidi = noteToMidi(b.note)
+          return (aMidi !== null ? aMidi : 0) - (bMidi !== null ? bMidi : 0)
+        })
+        const topLeft = sortedSelection[0]
+        const sourceRowRank = 127 - (noteToMidi(topLeft.note) ?? 0)
+
+        clipboardNotesRef.current = {
+          sourceStart: topLeft.start,
+          sourceRowRank,
+          notes: selected.map(n => ({
+            note: n.note,
+            start: n.start,
+            duration: n.duration,
+            sourceRowRank: 127 - (noteToMidi(n.note) ?? 0)
+          }))
+        }
+        return true
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        e.preventDefault()
+        if (e.shiftKey) handleRedo()
+        else handleUndo()
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+        e.preventDefault()
+        handleRedo()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+        if (!copySelectedToClipboard()) return
+        e.preventDefault()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'x') {
+        if (!copySelectedToClipboard()) return
+        e.preventDefault()
+        const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current) || tracksRef.current[0]
+        if (!track) return
+        saveHistory()
+        updateTrack(track.id, t => ({
+          ...t,
+          notes: t.notes.filter(n => !n.selected),
+        }))
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+        const clipboard = clipboardNotesRef.current
+        const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current) || tracksRef.current[0]
+        if (!clipboard || !track) return
+        e.preventDefault()
+        setPasteTargetTrackId(track.id)
+        setIsPasteMode(true)
+      } else if (e.key === 'Escape' && isPasteMode) {
+        e.preventDefault()
+        setIsPasteMode(false)
+        setPasteTargetTrackId(null)
+      } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current) || tracksRef.current[0]
+        if (!track) return
+        const selectedIds = (track.notes || []).filter(n => n.selected).map(n => n.id)
+        if (selectedIds.length === 0) return
+        e.preventDefault()
+        saveHistory()
+        updateTrack(track.id, t => ({
+          ...t,
+          notes: t.notes.filter(n => !n.selected),
+        }))
+      } else if (e.key === ' ') {
+        e.preventDefault()
+        if (isRecording) handleRecord()
+        else if (isPlaying) handleStop()
+        else handlePlay()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [handleUndo, handleRedo, handlePlay, handleStop, handleRecord, isPlaying, isRecording, isPasteMode, saveHistory, updateTrack])
+
+  // ─── Paste handler ─────────────────────────────────────────────────────────
+  const handlePastePlace = useCallback((notesToPlace) => {
+    const track = tracks.find(t => t.id === pasteTargetTrackId)
+    if (!track) return
+    const maxBeat = bars * beatsPerBar
+    saveHistory()
+    updateTrack(track.id, t => {
+      let nextNotes = (t.notes || []).map(note => ({ ...note, selected: false }))
+      const pastedIds = []
+      notesToPlace.forEach(n => {
+        if (n.start >= maxBeat) return
+        const newDuration = Math.max(0.05, Math.min(n.duration, maxBeat - n.start))
+        if (newDuration <= 0) return
+        const canonical = canonicalizeNoteName(n.note, namingRef.current)
+        const newId = generateId()
+        nextNotes = nextNotes.filter(existing => {
+          if (existing.note !== canonical) return true
+          const existingEnd = existing.start + existing.duration
+          const newEnd = n.start + newDuration
+          return !(n.start < existingEnd && newEnd > existing.start)
+        })
+        nextNotes.push({ id: newId, note: canonical, start: n.start, duration: newDuration, velocity: 0.8, selected: true })
+        pastedIds.push(newId)
+      })
+      return { ...t, notes: nextNotes }
+    })
+    setIsPasteMode(false)
+    setPasteTargetTrackId(null)
+  }, [pasteTargetTrackId, tracks, bars, beatsPerBar, saveHistory, updateTrack])
+
+  // ─── Render ────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col h-screen w-screen bg-background text-foreground overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-3 px-4 py-2 border-b border-border bg-card/50">
+        <h1 className="text-lg font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent whitespace-nowrap">
+          MidiMasterPro
+        </h1>
+
+        <div className="h-8 w-px bg-border" />
+
+        {/* Tempo */}
+        <div className="flex items-center gap-1.5">
+          <Label>Tempo</Label>
+          <Input
+            type="number"
+            value={tempo}
+            onChange={(e) => setTempo(Number(e.target.value))}
+            min="40"
+            max="240"
+            className="w-16 h-7"
+          />
+          <span className="text-xs text-muted-foreground">BPM</span>
+        </div>
+
+        <div className="h-8 w-px bg-border" />
+
+        {/* Key & Mode */}
+        <div className="flex items-center gap-1.5">
+          <Label>Key</Label>
+          <Select value={selectedKey} onChange={(e) => setSelectedKey(e.target.value)} className="w-16 h-7">
+            {KEYS.map(k => <option key={k} value={k}>{k}</option>)}
+          </Select>
+          <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-20 h-7">
+            {MODES.map(m => <option key={m} value={m}>{m}</option>)}
+          </Select>
+        </div>
+
+        <div className="h-8 w-px bg-border" />
+
+        {/* Time signature */}
+        <div className="flex items-center gap-1.5">
+          <Label>Time</Label>
+          <Select
+            value={`${timeSignature.numerator}/${timeSignature.denominator}`}
+            onChange={(e) => {
+              const preset = TIME_SIGNATURE_PRESETS.find(p => p.label === e.target.value)
+              if (preset) setTimeSignature({ numerator: preset.numerator, denominator: preset.denominator })
+            }}
+            className="w-16 h-7"
+          >
+            {TIME_SIGNATURE_PRESETS.map(ts => (
+              <option key={ts.label} value={ts.label}>{ts.label}</option>
+            ))}
+          </Select>
+        </div>
+
+        {/* Bars */}
+        <div className="flex items-center gap-1.5">
+          <Label>Bars</Label>
+          <Input
+            type="number"
+            value={bars}
+            onChange={(e) => setBars(Math.max(1, Math.min(32, Number(e.target.value))))}
+            min="1"
+            max="32"
+            className="w-14 h-7"
+          />
+        </div>
+
+        {/* Time division */}
+        <div className="flex items-center gap-1.5">
+          <Label>Grid</Label>
+          <Select value={timeDivision} onChange={(e) => setTimeDivision(e.target.value)} className="w-16 h-7">
+            {TIME_DIVISIONS.map(td => <option key={td} value={td}>{td}</option>)}
+          </Select>
+        </div>
+
+        <div className="flex-1" />
+
+        <div className="flex items-center gap-1.5">
+          <Button variant="ghost" size="icon" onClick={handleUndo} title="Undo (Ctrl+Z)">
+            <Undo2 className="h-4 w-4" />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={handleRedo} title="Redo (Ctrl+Shift+Z)">
+            <Redo2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+
+      {/* Transport bar */}
+      <TransportBar
+        isPlaying={isPlaying}
+        isRecording={isRecording}
+        isLooping={isLooping}
+        metronomeEnabled={metronomeEnabled}
+        annotationType={annotationType}
+        snapToGrid={snapToGrid}
+        onPlay={handlePlay}
+        onStop={handleStop}
+        onRecord={handleRecord}
+        onToggleLoop={() => setIsLooping(!isLooping)}
+        onToggleMetronome={() => setMetronomeEnabled(!metronomeEnabled)}
+        onAnnotationChange={setAnnotationType}
+        onSnapToGridChange={setSnapToGrid}
+        onExportMidi={handleExportMidi}
+        onExportWav={handleExportWav}
+        onExportXml={handleExportXml}
+        onImportMidi={handleImportMidi}
+        isExporting={isExporting}
+      />
+
+      {/* Track workspace */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        {tracks.map((track) => {
+          const isActive = track.id === activeTrackId
+          const isCollapsed = !!collapsedTracks[track.id]
+          const trackAnnotations = track.id === 'treble' ? trebleAnnotations : bassAnnotations
+
+          return (
+            <div
+              key={track.id}
+              className={`flex flex-col border-b border-border transition-colors ${isCollapsed ? '' : 'flex-1 min-h-0'} ${isActive ? 'bg-card/30' : 'bg-background'}`}
+              onClick={() => setActiveTrackId(track.id)}
+            >
+              {/* Track header */}
+              <div className="flex items-center justify-between px-3 py-1.5 border-b border-border/50">
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6"
+                    onClick={(e) => { e.stopPropagation(); setCollapsedTracks(prev => ({ ...prev, [track.id]: !prev[track.id] })) }}
+                    title={isCollapsed ? 'Expand track' : 'Collapse track'}
+                  >
+                    {isCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                  </Button>
+                  <button
+                    className={`text-sm font-semibold transition-colors ${isActive ? 'text-indigo-400' : 'text-muted-foreground'}`}
+                    onClick={(e) => { e.stopPropagation(); setActiveTrackId(track.id) }}
+                  >
+                    {track.name}
+                  </button>
+                  <span className="text-xs text-muted-foreground">
+                    {track.notes.length} notes
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs text-muted-foreground hover:text-red-400"
+                    onClick={(e) => { e.stopPropagation(); handleClearTrack(track.id) }}
+                    title="Clear track"
+                  >
+                    <Trash2 className="h-3 w-3 mr-1" /> Clear
+                  </Button>
+                </div>
+              </div>
+
+              {/* Piano roll */}
+              {!isCollapsed && (
+              <div className="flex-1 min-h-0 flex flex-col">
+                <PianoRoll
+                  trackId={track.id}
+                  notes={track.notes}
+                  bars={bars}
+                  beatsPerBar={beatsPerBar}
+                  timeDivision={timeDivision}
+                  lowestMidi={track.lowestMidi}
+                  highestMidi={track.highestMidi}
+                  isPlaying={isPlaying}
+                  isRecording={isRecording}
+                  cursorPosition={cursorPosition}
+                  playheadProgressRef={playheadProgressRef}
+                  snapToGrid={snapToGrid}
+                  zoom={workspaceZoom}
+                  onZoomChange={setWorkspaceZoom}
+                  naming={naming}
+                  annotationType={annotationType}
+                  annotations={trackAnnotations}
+                  activeMidiNotes={isActive ? activeMidiNotes : {}}
+                  scrollSyncRef={scrollSyncRef}
+                  isPasteMode={isPasteMode && pasteTargetTrackId === track.id}
+                  pasteClipboard={isPasteMode && pasteTargetTrackId === track.id && clipboardNotesRef.current ? {
+                    notes: clipboardNotesRef.current.notes.map(n => ({
+                      relStart: n.start - clipboardNotesRef.current.sourceStart,
+                      relRowRank: (n.sourceRowRank ?? 0) - clipboardNotesRef.current.sourceRowRank,
+                      duration: n.duration
+                    }))
+                  } : null}
+                  onPastePlace={isPasteMode && pasteTargetTrackId === track.id ? handlePastePlace : undefined}
+                  onNoteAdd={(noteName, start, duration) => handleNoteAdd(track.id, noteName, start, duration)}
+                  onNoteUpdate={(noteId, updates) => handleNoteUpdate(track.id, noteId, updates)}
+                  onNotesUpdate={(updatesById) => handleNotesUpdate(track.id, updatesById)}
+                  onNoteDelete={(noteId) => handleNoteDelete(track.id, noteId)}
+                  onNotesSelect={(noteIds, exclusive) => handleNotesSelect(track.id, noteIds, exclusive)}
+                  onNotePlay={handleNotePlay}
+                />
+              </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Status bar */}
+      <div className="flex items-center justify-between px-4 py-1.5 border-t border-border bg-card/50 text-xs text-muted-foreground">
+        <div className="flex items-center gap-4">
+          <span>{selectedKey} {mode}</span>
+          <span>{tempo} BPM</span>
+          <span>{timeSignature.numerator}/{timeSignature.denominator}</span>
+          <span>{bars} bars</span>
+        </div>
+        <div className="flex items-center gap-4">
+          {isRecording && <span className="text-red-400 font-semibold">● Recording</span>}
+          {isPlaying && <span className="text-indigo-400">▶ Playing</span>}
+          <span>Space: Play/Stop · Ctrl+Z: Undo · Double-click to add note</span>
+        </div>
+      </div>
+    </div>
+  )
+}

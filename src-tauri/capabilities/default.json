@@ -1,0 +1,13 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for MidiMasterPro",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-save",
+    "dialog:allow-open",
+    "fs:allow-write-file",
+    "fs:allow-read-file",
+    "fs:allow-create-dir"
+  ]
+}
