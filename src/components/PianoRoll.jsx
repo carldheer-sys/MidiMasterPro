@@ -9,7 +9,7 @@ const CELL_HEIGHT = 20
 const INITIAL_BEAT_WIDTH = 40
 const BAR_LABEL_HEIGHT = 20
 const ANNOTATION_HEIGHT = 20
-const KEYBOARD_WIDTH = 80
+const KEYBOARD_WIDTH = 48
 
 function generateNoteRange(lowestMidi, highestMidi) {
   const range = []
@@ -62,6 +62,7 @@ export default function PianoRoll({
   annotationType = 'none',
   annotations = [],
   activeMidiNotes = {},
+  activeMidiKeysRef = { current: {} },
   onNoteAdd,
   onNoteUpdate,
   onNotesUpdate,
@@ -69,6 +70,9 @@ export default function PianoRoll({
   onNotesSelect,
   onNotePlay,
   scrollSyncRef,
+  regionStart = 0,
+  regionEnd = 1,
+  onRegionChange,
   isPasteMode = false,
   pasteClipboard = null,
   onPastePlace,
@@ -84,6 +88,8 @@ export default function PianoRoll({
   const [pastePreviewPos, setPastePreviewPos] = useState(null)
   const hasDraggedRef = useRef(false)
   const marqueeRef = useRef(null)
+  const keyGlowRefs = useRef(new Map())
+  const regionDragRef = useRef(null)
 
   const beatWidth = INITIAL_BEAT_WIDTH * zoom
   const barWidth = beatsPerBar * beatWidth
@@ -102,18 +108,25 @@ export default function PianoRoll({
     return map
   }, [noteRange])
 
-  // Playhead animation loop
+  // Playhead animation + key glow loop
   useEffect(() => {
     const tick = () => {
       if ((isPlaying || isRecording) && playheadRef.current) {
         const progress = playheadProgressRef.current || 0
         playheadRef.current.style.transform = `translateX(${progress * gridWidth}px)`
       }
+      const activeKeys = activeMidiKeysRef.current
+      keyGlowRefs.current.forEach((el, notePitch) => {
+        el.style.opacity = activeKeys[notePitch] ? '1' : '0'
+      })
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
-    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
-  }, [isPlaying, isRecording, gridWidth])
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      keyGlowRefs.current.forEach((el) => { el.style.opacity = '0' })
+    }
+  }, [isPlaying, isRecording, gridWidth, activeMidiKeysRef, playheadProgressRef])
 
   // Wheel handler: shift+scroll = pan, ctrl/cmd+scroll = zoom
   const zoomRef = useRef(zoom)
@@ -167,6 +180,39 @@ export default function PianoRoll({
       }
     }
   }, [scrollSyncRef])
+
+  // Region handle drag
+  const handleRegionMouseDown = useCallback((e, handle) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const gridRect = gridRef.current?.getBoundingClientRect()
+    const gridLeft = gridRect ? gridRect.left : 0
+    const snapFraction = divisionWidth / gridWidth
+    const minGap = snapFraction
+
+    const onMove = (ev) => {
+      const rawPx = ev.clientX - gridLeft
+      const rawFraction = rawPx / gridWidth
+      const snapped = Math.round(rawFraction / snapFraction) * snapFraction
+
+      if (handle === 'start') {
+        const next = Math.max(0, Math.min(regionEnd - minGap, snapped))
+        onRegionChange?.(next, regionEnd)
+      } else {
+        const next = Math.min(1, Math.max(regionStart + minGap, snapped))
+        onRegionChange?.(regionStart, next)
+      }
+    }
+
+    const onUp = () => {
+      regionDragRef.current = null
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [regionStart, regionEnd, gridWidth, divisionWidth, onRegionChange])
 
   // Row click — add note (or place paste in paste mode)
   const handleRowMouseDown = useCallback((e, noteName) => {
@@ -504,6 +550,14 @@ export default function PianoRoll({
                 }
               }}
             >
+              <div
+                ref={(el) => {
+                  if (el) keyGlowRefs.current.set(note, el)
+                  else keyGlowRefs.current.delete(note)
+                }}
+                className="pointer-events-none absolute inset-[3px] rounded-sm ring-2 ring-indigo-400/80"
+                style={{ opacity: 0, boxShadow: '0 0 10px rgba(129,140,248,0.7),0 0 20px rgba(129,140,248,0.4)' }}
+              />
               <span className="relative z-40 font-mono text-[10px] font-medium text-right w-full pr-1 leading-none">{note}</span>
             </div>
           ))}
@@ -537,6 +591,36 @@ export default function PianoRoll({
               backgroundImage: `repeating-linear-gradient(90deg, transparent, transparent ${barWidth - 2}px, hsl(var(--border)) ${barWidth - 2}px, hsl(var(--border)) ${barWidth}px)`,
             }}
           />
+
+          {/* Region overlays */}
+          {(() => {
+            const rsPx = regionStart * gridWidth
+            const rePx = regionEnd * gridWidth
+            return (
+              <>
+                {/* Dark overlay left of region */}
+                {regionStart > 0 && (
+                  <div className="absolute top-0 bottom-0 pointer-events-none z-10" style={{ left: 0, width: `${rsPx}px`, background: 'rgba(0,0,0,0.38)' }} />
+                )}
+                {/* Dark overlay right of region */}
+                {regionEnd < 1 && (
+                  <div className="absolute top-0 bottom-0 pointer-events-none z-10" style={{ left: `${rePx}px`, right: 0, background: 'rgba(0,0,0,0.38)' }} />
+                )}
+                {/* Cyan tint on bar-label area within region */}
+                <div className="absolute pointer-events-none z-20" style={{
+                  top: 0, left: `${rsPx}px`, width: `${rePx - rsPx}px`, height: `${BAR_LABEL_HEIGHT}px`,
+                  background: 'rgba(56,189,248,0.08)', borderBottom: '1px solid rgba(56,189,248,0.35)',
+                }} />
+                {/* Vertical guide lines through note grid */}
+                <div className="absolute pointer-events-none z-20" style={{
+                  top: `${BAR_LABEL_HEIGHT}px`, bottom: 0, left: `${rsPx - 1}px`, width: '2px', background: 'rgba(56,189,248,0.4)',
+                }} />
+                <div className="absolute pointer-events-none z-20" style={{
+                  top: `${BAR_LABEL_HEIGHT}px`, bottom: 0, left: `${rePx - 1}px`, width: '2px', background: 'rgba(56,189,248,0.4)',
+                }} />
+              </>
+            )
+          })()}
 
           {/* Note rows */}
           {noteRange.map((note, idx) => (
@@ -738,8 +822,8 @@ export default function PianoRoll({
             </>
           )}
 
-          {/* Bar numbers */}
-          <div className="absolute left-0 right-0 flex z-40" style={{ top: 0, height: `${BAR_LABEL_HEIGHT}px` }}>
+          {/* Bar numbers + region handles */}
+          <div className="absolute left-0 right-0 z-40 select-none" style={{ top: 0, height: `${BAR_LABEL_HEIGHT}px` }}>
             {Array.from({ length: bars }).map((_, barIndex) => (
               <div
                 key={`bar-${barIndex}`}
@@ -749,11 +833,52 @@ export default function PianoRoll({
                   left: `${barIndex * barWidth}px`,
                   width: `${barWidth}px`,
                   height: '100%',
+                  pointerEvents: 'none',
                 }}
               >
                 {barIndex + 1}
               </div>
             ))}
+
+            {/* Region start handle */}
+            {(() => {
+              const rsPx = regionStart * gridWidth
+              return (
+                <div
+                  className="absolute top-0 z-50 cursor-ew-resize group"
+                  style={{ left: `${rsPx}px`, width: 0, height: `${BAR_LABEL_HEIGHT}px` }}
+                  onMouseDown={(e) => handleRegionMouseDown(e, 'start')}
+                >
+                  <div className="absolute top-0 bottom-0 pointer-events-none group-hover:opacity-100 transition-opacity"
+                    style={{ left: '-1px', width: '2px', background: 'rgba(56,189,248,0.85)', boxShadow: '0 0 4px rgba(56,189,248,0.5)' }}
+                  />
+                  <div className="absolute pointer-events-none group-hover:bg-sky-300 transition-colors"
+                    style={{ top: 0, left: '-5px', width: '10px', height: '10px', background: 'rgba(56,189,248,0.85)', borderRadius: '2px 2px 0 0', boxShadow: '0 0 4px rgba(56,189,248,0.4)' }}
+                  />
+                  <div className="absolute top-0 bottom-0" style={{ left: '-7px', width: '14px' }} />
+                </div>
+              )
+            })()}
+
+            {/* Region end handle */}
+            {(() => {
+              const rePx = regionEnd * gridWidth
+              return (
+                <div
+                  className="absolute top-0 z-50 cursor-ew-resize group"
+                  style={{ left: `${rePx}px`, width: 0, height: `${BAR_LABEL_HEIGHT}px` }}
+                  onMouseDown={(e) => handleRegionMouseDown(e, 'end')}
+                >
+                  <div className="absolute top-0 bottom-0 pointer-events-none group-hover:opacity-100 transition-opacity"
+                    style={{ left: '-1px', width: '2px', background: 'rgba(56,189,248,0.85)', boxShadow: '0 0 4px rgba(56,189,248,0.5)' }}
+                  />
+                  <div className="absolute pointer-events-none group-hover:bg-sky-300 transition-colors"
+                    style={{ top: 0, left: '-5px', width: '10px', height: '10px', background: 'rgba(56,189,248,0.85)', borderRadius: '2px 2px 0 0', boxShadow: '0 0 4px rgba(56,189,248,0.4)' }}
+                  />
+                  <div className="absolute top-0 bottom-0" style={{ left: '-7px', width: '14px' }} />
+                </div>
+              )
+            })()}
           </div>
         </div>
       </div>

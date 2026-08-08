@@ -164,8 +164,8 @@ function buildHarmonyXml(chordLabel) {
   if (!chordLabel) return ''
   const kindMap = {
     '': 'major', 'm': 'minor', 'maj7': 'major-seventh', 'm7': 'minor-seventh',
-    '7': 'dominant', 'dim': 'diminished', 'dim7': 'diminished-seventh',
-    'm7b5': 'half-diminished', 'aug': 'augmented', 'sus4': 'suspended-fourth',
+    '7': 'dominant', 'o': 'diminished', 'o7': 'diminished-seventh',
+    'm7b5': 'half-diminished', '+': 'augmented', 'sus4': 'suspended-fourth',
     'sus2': 'suspended-second', '6': 'major-sixth', 'm6': 'minor-sixth',
   }
   const slashIdx = chordLabel.indexOf('/')
@@ -217,7 +217,7 @@ function getAnnotationAtBeat(annotations, beat) {
 function buildStaffForPart(notes, options) {
   const {
     clefSign, clefLine, voice, keyFifths, beatsPerMeasure, beatType, timeBeats,
-    useFlats, annotations, annotationTypes, totalBeats, tempo
+    useFlats, annotations, annotationTypes, totalBeats, tempo, includeTempo = true
   } = options
 
   const totalMeasures = Math.max(1, Math.ceil(totalBeats / beatsPerMeasure - EPSILON))
@@ -261,8 +261,10 @@ function buildStaffForPart(notes, options) {
 
     if (m === 0) {
       measureContent += buildMeasureAttributes(DIVISIONS_PER_QUARTER, keyFifths, timeBeats, beatType, clefSign, clefLine) + '\n'
-      const tempoXml = buildTempoDirectionXml(tempo)
-      if (tempoXml) measureContent += tempoXml + '\n'
+      if (includeTempo) {
+        const tempoXml = buildTempoDirectionXml(tempo)
+        if (tempoXml) measureContent += tempoXml + '\n'
+      }
     }
 
     let posInMeasure = 0
@@ -398,7 +400,14 @@ export function exportToMusicXml(options) {
     bassNotes = [],
     trebleAnnotations = [],
     bassAnnotations = [],
-    annotationType = 'none',
+    includeTreble = true,
+    includeBass = true,
+    enableTrebleScaleDegrees = false,
+    enableTrebleChordNames = false,
+    enableTrebleRomanNumerals = false,
+    enableBassScaleDegrees = false,
+    enableBassChordNames = false,
+    enableBassRomanNumerals = false,
     key,
     mode,
     tempo,
@@ -419,47 +428,58 @@ export function exportToMusicXml(options) {
   const maxNoteEnd = allNotes.length > 0 ? Math.max(...allNotes.map(n => n.start + n.duration)) : beatsPerMeasure
   const totalBeats = Math.max(bars * beatsPerMeasure, Math.ceil(maxNoteEnd / beatsPerMeasure - EPSILON) * beatsPerMeasure)
 
-  const annTypes = []
-  if (annotationType === 'scale_degrees') annTypes.push('scale_degrees')
-  if (annotationType === 'chord_names') annTypes.push('chord_names')
-  if (annotationType === 'roman_numerals') annTypes.push('roman_numerals')
+  const buildAnnData = (annotations, enableScaleDegrees, enableChordNames, enableRomanNumerals) => {
+    const annTypes = []
+    if (enableScaleDegrees) annTypes.push('scale_degrees')
+    if (enableChordNames) annTypes.push('chord_names')
+    if (enableRomanNumerals) annTypes.push('roman_numerals')
 
-  const trebleAnnData = trebleAnnotations.map(a => ({
-    start: a.start,
-    scale_degree: a.degree_info?.scale_degree || null,
-    chord_label: a.chord_info?.chord_label || null,
-    roman_numeral: a.chord_info?.roman_numeral || null,
-  })).filter(a => a.scale_degree || a.chord_label || a.roman_numeral)
+    const data = annotations.map(a => ({
+      start: a.start,
+      scale_degree: enableScaleDegrees ? (a.degree_info?.scale_degree || null) : null,
+      chord_label: enableChordNames ? (a.chord_info?.chord_label || null) : null,
+      roman_numeral: enableRomanNumerals ? (a.chord_info?.roman_numeral || null) : null,
+    })).filter(a => a.scale_degree || a.chord_label || a.roman_numeral)
 
-  const bassAnnData = bassAnnotations.map(a => ({
-    start: a.start,
-    scale_degree: a.degree_info?.scale_degree || null,
-    chord_label: a.chord_info?.chord_label || null,
-    roman_numeral: a.chord_info?.roman_numeral || null,
-  })).filter(a => a.scale_degree || a.chord_label || a.roman_numeral)
+    return { data, annTypes }
+  }
+
+  const trebleResult = buildAnnData(trebleAnnotations, enableTrebleScaleDegrees, enableTrebleChordNames, enableTrebleRomanNumerals)
+  const bassResult = buildAnnData(bassAnnotations, enableBassScaleDegrees, enableBassChordNames, enableBassRomanNumerals)
 
   const parts = []
   const partList = []
+  let partNum = 0
 
-  partList.push({ id: 'P1', name: 'Treble' })
-  parts.push({
-    id: 'P1',
-    xml: buildStaffForPart(trebleNotes, {
-      clefSign: 'G', clefLine: 2, voice: 1, keyFifths, beatsPerMeasure,
-      beatType: actualBeatType, useFlats, annotations: trebleAnnData,
-      annotationTypes: annTypes, totalBeats, tempo, timeBeats
+  if (includeTreble) {
+    partNum++
+    const partId = `P${partNum}`
+    partList.push({ id: partId, name: '' })
+    parts.push({
+      id: partId,
+      xml: buildStaffForPart(trebleNotes, {
+        clefSign: 'G', clefLine: 2, voice: 1, keyFifths, beatsPerMeasure,
+        beatType: actualBeatType, useFlats, annotations: trebleResult.data,
+        annotationTypes: trebleResult.annTypes, totalBeats, tempo, timeBeats,
+        includeTempo: true
+      })
     })
-  })
+  }
 
-  partList.push({ id: 'P2', name: 'Bass' })
-  parts.push({
-    id: 'P2',
-    xml: buildStaffForPart(bassNotes, {
-      clefSign: 'F', clefLine: 4, voice: 1, keyFifths, beatsPerMeasure,
-      beatType: actualBeatType, useFlats, annotations: bassAnnData,
-      annotationTypes: annTypes, totalBeats, tempo, timeBeats
+  if (includeBass) {
+    partNum++
+    const partId = `P${partNum}`
+    partList.push({ id: partId, name: '' })
+    parts.push({
+      id: partId,
+      xml: buildStaffForPart(bassNotes, {
+        clefSign: 'F', clefLine: 4, voice: 1, keyFifths, beatsPerMeasure,
+        beatType: actualBeatType, useFlats, annotations: bassResult.data,
+        annotationTypes: bassResult.annTypes, totalBeats, tempo, timeBeats,
+        includeTempo: !includeTreble
+      })
     })
-  })
+  }
 
   const partListXml = partList.map(p =>
     `    <score-part id="${p.id}">\n      <part-name>${xmlEscape(p.name)}</part-name>\n    </score-part>`

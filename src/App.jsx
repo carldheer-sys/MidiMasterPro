@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import * as Tone from 'tone'
-import { Undo2, Redo2, Trash2, ChevronDown, ChevronRight, Download, Upload } from 'lucide-react'
+import { Undo2, Redo2, Trash2, ChevronDown, ChevronRight, ChevronUp, Download, Upload, MoveVertical } from 'lucide-react'
 import PianoRoll from './components/PianoRoll'
 import TransportBar from './components/TransportBar'
+import ExportXmlDialog from './components/ExportXmlDialog'
 import { Button } from './components/ui/button'
 import { Select } from './components/ui/select'
 import { Input } from './components/ui/input'
 import { Label } from './components/ui/label'
+import { DualSlider } from './components/ui/DualSlider'
 import { KEYS, MODES, TIME_SIGNATURE_PRESETS, TIME_DIVISIONS } from './constants'
 import audioEngine from './lib/audioEngine'
 import { analyzeAnnotations } from './lib/annotations'
@@ -17,7 +19,7 @@ import { saveBlob } from './lib/fileSave'
 import { noteToMidi, midiToNote, canonicalizeNoteName, getKeyPreferredNaming, generateId } from './lib/musicUtils'
 import { useMIDIInput } from './hooks/useMIDIInput'
 
-const TREBLE_RANGE = { lowestMidi: 48, highestMidi: 84 } // C3 to C6
+const TREBLE_RANGE = { lowestMidi: 36, highestMidi: 72 } // C2 to C5
 const BASS_RANGE = { lowestMidi: 24, highestMidi: 60 }  // C1 to C4
 
 function makeInitialTrack(id, name, config) {
@@ -51,6 +53,8 @@ export default function App() {
   const [annotationType, setAnnotationType] = useState('none')
   const [snapToGrid, setSnapToGrid] = useState(false)
   const [workspaceZoom, setWorkspaceZoom] = useState(1)
+  const [regionStart, setRegionStart] = useState(0)
+  const [regionEnd, setRegionEnd] = useState(1)
 
   // ─── Tracks ────────────────────────────────────────────────────────────────
   const [tracks, setTracks] = useState([
@@ -59,7 +63,7 @@ export default function App() {
   ])
   const [activeTrackId, setActiveTrackId] = useState('treble')
   const [activeMidiNotes, setActiveMidiNotes] = useState({})
-  const [collapsedTracks, setCollapsedTracks] = useState({})
+  const [collapsedTracks, setCollapsedTracks] = useState({ bass: true })
   const [isPasteMode, setIsPasteMode] = useState(false)
   const [pasteTargetTrackId, setPasteTargetTrackId] = useState(null)
 
@@ -82,6 +86,9 @@ export default function App() {
   const namingRef = useRef('sharp')
   const scrollSyncRef = useRef([])
   const clipboardNotesRef = useRef(null)
+  const activeMidiKeysRef = useRef({})
+  const regionStartRef = useRef(regionStart)
+  const regionEndRef = useRef(regionEnd)
 
   useEffect(() => { tracksRef.current = tracks }, [tracks])
   useEffect(() => { isRecordingRef.current = isRecording }, [isRecording])
@@ -93,6 +100,9 @@ export default function App() {
   useEffect(() => { timeDivisionRef.current = timeDivision }, [timeDivision])
   useEffect(() => { timeSignatureRef.current = timeSignature }, [timeSignature])
   useEffect(() => { snapToGridRef.current = snapToGrid }, [snapToGrid])
+  useEffect(() => { regionStartRef.current = regionStart }, [regionStart])
+  useEffect(() => { regionEndRef.current = regionEnd }, [regionEnd])
+  useEffect(() => { setRegionStart(0); setRegionEnd(1) }, [bars])
 
   const naming = useMemo(() => getKeyPreferredNaming(selectedKey, mode), [selectedKey, mode])
   useEffect(() => { namingRef.current = naming }, [naming])
@@ -129,15 +139,9 @@ export default function App() {
   }, [tempo, timeSignature, bars, isLooping])
 
   // ─── Annotations ───────────────────────────────────────────────────────────
-  const trebleAnnotations = useMemo(() => {
-    if (annotationType === 'none') return []
-    return analyzeAnnotations(tracks[0].notes, selectedKey, mode, annotationType)
-  }, [tracks[0].notes, selectedKey, mode, annotationType])
+  const trebleAnnotations = annotationType === 'none' ? [] : analyzeAnnotations(tracks[0].notes, selectedKey, mode, annotationType)
 
-  const bassAnnotations = useMemo(() => {
-    if (annotationType === 'none') return []
-    return analyzeAnnotations(tracks[1].notes, selectedKey, mode, annotationType)
-  }, [tracks[1].notes, selectedKey, mode, annotationType])
+  const bassAnnotations = annotationType === 'none' ? [] : analyzeAnnotations(tracks[1].notes, selectedKey, mode, annotationType)
 
   // ─── Note operations ───────────────────────────────────────────────────────
   const saveHistory = useCallback(() => {
@@ -230,9 +234,16 @@ export default function App() {
 
   const scheduleAllNotes = useCallback(() => {
     audioEngine.clearScheduledNotes()
+    const totalBeats = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+    const startBeat = regionStartRef.current * totalBeats
+    const endBeat = regionEndRef.current * totalBeats
     for (const track of tracksRef.current) {
       if (track.notes.length > 0) {
-        audioEngine.scheduleNotes(track.notes, timeDivisionRef.current, barsRef.current)
+        const regionNotes = track.notes
+          .filter(n => n.start >= startBeat - 1e-6 && n.start < endBeat)
+        if (regionNotes.length > 0) {
+          audioEngine.scheduleNotes(regionNotes, timeDivisionRef.current, barsRef.current)
+        }
       }
     }
   }, [])
@@ -250,12 +261,19 @@ export default function App() {
       audioEngine.stopMetronome()
       scheduleAllNotes()
       if (metronomeEnabled) audioEngine.startMetronome()
-      await audioEngine.start()
-      if (!isLooping) audioEngine.scheduleStopEvent(bars)
+      const totalBeats = bars * beatsPerBar
+      const startBeat = regionStart * totalBeats
+      const endBeat = regionEnd * totalBeats
+      await audioEngine.start(startBeat)
+      if (isLooping) {
+        audioEngine.setLoopEnabledBeats(true, startBeat, endBeat)
+      } else {
+        audioEngine.scheduleStopAtBeats(endBeat)
+      }
     } else {
       audioEngine.pause()
     }
-  }, [isPlaying, isLooping, bars, metronomeEnabled, scheduleAllNotes, audioStarted])
+  }, [isPlaying, isLooping, bars, beatsPerBar, regionStart, regionEnd, metronomeEnabled, scheduleAllNotes, audioStarted])
 
   const handleStop = useCallback(() => {
     setIsRecording(false)
@@ -289,22 +307,32 @@ export default function App() {
     audioEngine.stop()
     audioEngine.clearScheduledNotes()
 
+    setIsCountingDown(true)
+    await audioEngine.playCountdown(1)
+    setIsCountingDown(false)
+
     if (metronomeEnabled) {
       await audioEngine.startMetronome()
     }
-    await audioEngine.start()
-    audioEngine.scheduleStopEvent(bars)
-  }, [isRecording, metronomeEnabled, bars, audioStarted])
+    const totalBeats = bars * beatsPerBar
+    const startBeat = regionStart * totalBeats
+    const endBeat = regionEnd * totalBeats
+    scheduleAllNotes()
+    await audioEngine.start(startBeat)
+    audioEngine.scheduleStopAtBeats(endBeat)
+  }, [isRecording, metronomeEnabled, bars, beatsPerBar, regionStart, regionEnd, scheduleAllNotes, audioStarted])
 
   // ─── MIDI input ────────────────────────────────────────────────────────────
   const commitPendingNotes = useCallback(() => {
-    const maxDuration = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+    const totalBeats = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+    const startBeat = regionStartRef.current * totalBeats
+    const endBeat = regionEndRef.current * totalBeats
     Object.keys(activeMidiNotesRef.current).forEach(id => {
       const noteRecord = activeMidiNotesRef.current[id]
       if (noteRecord) {
         const commitTrackId = noteRecord.trackId || activeTrackIdRef.current
         let finalStart = noteRecord.start
-        let duration = maxDuration - finalStart
+        let duration = endBeat - finalStart
 
         if (snapToGridRef.current) {
           const bpd = beatsPerDivisionFromTimeDivision(timeDivisionRef.current, timeSignatureRef.current)
@@ -313,9 +341,10 @@ export default function App() {
           if (duration < bpd) duration = bpd
         }
 
-        if (finalStart >= maxDuration) return
-        if (finalStart + duration > maxDuration) {
-          duration = Math.max(0.1, maxDuration - finalStart)
+        if (finalStart >= endBeat) return
+        if (finalStart < startBeat) finalStart = startBeat
+        if (finalStart + duration > endBeat) {
+          duration = Math.max(0.1, endBeat - finalStart)
         }
 
         handleNoteAdd(commitTrackId, noteRecord.note, finalStart, duration)
@@ -344,6 +373,8 @@ export default function App() {
 
     audioEngine.startNote(canonicalNote, velocity / 127)
 
+    activeMidiKeysRef.current = { ...activeMidiKeysRef.current, [canonicalNote]: true }
+
     if (isRecordingRef.current && !isCountingDownRef.current) {
       const currentBeat = Tone.Transport.ticks / Tone.Transport.PPQ
       const noteId = generateId()
@@ -361,9 +392,15 @@ export default function App() {
 
     audioEngine.stopNote(canonicalNote)
 
+    const updatedKeys = { ...activeMidiKeysRef.current }
+    delete updatedKeys[canonicalNote]
+    activeMidiKeysRef.current = updatedKeys
+
     if (isRecordingRef.current && !isCountingDownRef.current) {
       const currentBeat = Tone.Transport.ticks / Tone.Transport.PPQ
-      const maxDuration = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+      const totalBeats = barsRef.current * beatsPerBarFromTimeSignature(timeSignatureRef.current)
+      const startBeat = regionStartRef.current * totalBeats
+      const endBeat = regionEndRef.current * totalBeats
 
       // Find the active note for this pitch
       const entries = Object.entries(activeMidiNotesRef.current)
@@ -381,7 +418,7 @@ export default function App() {
             if (duration < 0.1) duration = 0.1
           }
 
-          if (finalStart >= maxDuration) {
+          if (finalStart >= endBeat) {
             setActiveMidiNotes(prev => {
               const updated = { ...prev }
               delete updated[id]
@@ -391,8 +428,9 @@ export default function App() {
             continue
           }
 
-          if (finalStart + duration > maxDuration) {
-            duration = Math.max(0.1, maxDuration - finalStart)
+          if (finalStart < startBeat) finalStart = startBeat
+          if (finalStart + duration > endBeat) {
+            duration = Math.max(0.1, endBeat - finalStart)
           }
 
           handleNoteAdd(record.trackId || activeTrackIdRef.current, canonicalNote, finalStart, duration)
@@ -409,6 +447,12 @@ export default function App() {
   }, [handleNoteAdd])
 
   useMIDIInput(handleMidiNoteOn, handleMidiNoteOff)
+
+  // ─── Region ────────────────────────────────────────────────────────────────
+  const handleRegionChange = useCallback((start, end) => {
+    setRegionStart(start)
+    setRegionEnd(end)
+  }, [])
 
   // ─── Undo / Redo ───────────────────────────────────────────────────────────
   const handleUndo = useCallback(() => {
@@ -436,6 +480,16 @@ export default function App() {
     saveHistory()
     updateTrack(trackId, t => ({ ...t, notes: [] }))
   }, [saveHistory, updateTrack])
+
+  const handleFitRange = useCallback((trackId) => {
+    const track = tracksRef.current.find(t => t.id === trackId)
+    if (!track) return
+    const midis = (track.notes || []).map(n => noteToMidi(n.note)).filter(m => m !== null && m !== undefined)
+    if (midis.length === 0) return
+    const low = Math.max(21, Math.min(...midis) - 3)
+    const high = Math.min(108, Math.max(...midis) + 3)
+    updateTrack(trackId, t => ({ ...t, lowestMidi: low, highestMidi: high }))
+  }, [updateTrack])
 
   // ─── Export / Import ───────────────────────────────────────────────────────
   const handleExportMidi = useCallback(async () => {
@@ -466,14 +520,56 @@ export default function App() {
     }
   }, [tracks, tempo, bars, timeSignature])
 
-  const handleExportXml = useCallback(async () => {
+  const handleExportXml = useCallback(async (opts) => {
     try {
+      const {
+        includeTreble, includeBass,
+        enableTrebleScaleDegrees, enableTrebleChordNames, enableTrebleRomanNumerals,
+        enableBassScaleDegrees, enableBassChordNames, enableBassRomanNumerals,
+      } = opts
+
+      const mergeAnnotations = (degreeAnns, chordAnns) => {
+        const map = new Map()
+        for (const a of degreeAnns) {
+          map.set(a.start, { start: a.start, degree_info: a.degree_info, chord_info: null, pitch: a.pitch, note: a.note, duration: a.duration })
+        }
+        for (const a of chordAnns) {
+          const existing = map.get(a.start)
+          if (existing) {
+            existing.chord_info = a.chord_info
+          } else {
+            map.set(a.start, { start: a.start, degree_info: null, chord_info: a.chord_info, pitch: a.pitch, note: a.note, duration: a.duration })
+          }
+        }
+        return Array.from(map.values()).sort((a, b) => a.start - b.start)
+      }
+
+      const buildClefAnnotations = (notes, enableScaleDegrees, enableChordNames, enableRomanNumerals) => {
+        const degreeAnns = enableScaleDegrees ? analyzeAnnotations(notes, selectedKey, mode, 'scale_degrees') : []
+        const chordAnns = (enableChordNames || enableRomanNumerals) ? analyzeAnnotations(notes, selectedKey, mode, 'chord_names') : []
+        return mergeAnnotations(degreeAnns, chordAnns)
+      }
+
+      const trebleAnn = includeTreble
+        ? buildClefAnnotations(tracks[0].notes, enableTrebleScaleDegrees, enableTrebleChordNames, enableTrebleRomanNumerals)
+        : []
+      const bassAnn = includeBass
+        ? buildClefAnnotations(tracks[1].notes, enableBassScaleDegrees, enableBassChordNames, enableBassRomanNumerals)
+        : []
+
       const xml = exportToMusicXml({
-        trebleNotes: tracks[0].notes,
-        bassNotes: tracks[1].notes,
-        trebleAnnotations,
-        bassAnnotations,
-        annotationType,
+        trebleNotes: includeTreble ? tracks[0].notes : [],
+        bassNotes: includeBass ? tracks[1].notes : [],
+        trebleAnnotations: trebleAnn,
+        bassAnnotations: bassAnn,
+        includeTreble,
+        includeBass,
+        enableTrebleScaleDegrees,
+        enableTrebleChordNames,
+        enableTrebleRomanNumerals,
+        enableBassScaleDegrees,
+        enableBassChordNames,
+        enableBassRomanNumerals,
         key: selectedKey,
         mode,
         tempo,
@@ -487,7 +583,7 @@ export default function App() {
       console.error('MusicXML export failed:', err)
       alert('MusicXML export failed: ' + err.message)
     }
-  }, [tracks, trebleAnnotations, bassAnnotations, annotationType, selectedKey, mode, tempo, timeSignature, bars])
+  }, [tracks, selectedKey, mode, tempo, timeSignature, bars])
 
   const handleImportMidi = useCallback(async () => {
     const input = document.createElement('input')
@@ -502,20 +598,13 @@ export default function App() {
 
         saveHistory()
 
-        // Distribute imported tracks to treble/bass based on pitch range
-        const newTracks = [...tracksRef.current]
-        if (result.tracks.length === 1) {
-          // Single track: split by pitch (MIDI >= 60 goes to treble, < 60 to bass)
-          const allNotes = result.tracks[0].notes
-          const trebleNotes = allNotes.filter(n => noteToMidi(n.note) >= 60)
-          const bassNotes = allNotes.filter(n => noteToMidi(n.note) < 60)
-          newTracks[0] = { ...newTracks[0], notes: trebleNotes }
-          newTracks[1] = { ...newTracks[1], notes: bassNotes }
-        } else {
-          // Multiple tracks: assign first to treble, second to bass
-          newTracks[0] = { ...newTracks[0], notes: result.tracks[0]?.notes || [] }
-          newTracks[1] = { ...newTracks[1], notes: result.tracks[1]?.notes || [] }
-        }
+        // Import all notes into the active track
+        const allNotes = result.tracks.flatMap(t => t.notes || [])
+        const newTracks = tracksRef.current.map(t =>
+          t.id === activeTrackIdRef.current
+            ? { ...t, notes: allNotes }
+            : t
+        )
 
         setTracks(newTracks)
         if (result.bars) setBars(result.bars)
@@ -660,14 +749,31 @@ export default function App() {
         {/* Tempo */}
         <div className="flex items-center gap-1.5">
           <Label>Tempo</Label>
-          <Input
-            type="number"
-            value={tempo}
-            onChange={(e) => setTempo(Number(e.target.value))}
-            min="40"
-            max="240"
-            className="w-16 h-7"
-          />
+          <div className="flex items-center bg-secondary border border-border rounded-md h-7">
+            <button
+              className="px-1 h-full text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() => setTempo(t => Math.max(40, t - 1))}
+              title="Decrease tempo"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+            <input
+              type="text"
+              value={tempo}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10)
+                if (!isNaN(v)) setTempo(Math.max(40, Math.min(240, v)))
+              }}
+              className="w-10 text-center text-sm bg-transparent text-foreground focus:outline-none [appearance:textfield]"
+            />
+            <button
+              className="px-1 h-full text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() => setTempo(t => Math.min(240, t + 1))}
+              title="Increase tempo"
+            >
+              <ChevronUp className="h-3.5 w-3.5" />
+            </button>
+          </div>
           <span className="text-xs text-muted-foreground">BPM</span>
         </div>
 
@@ -706,14 +812,31 @@ export default function App() {
         {/* Bars */}
         <div className="flex items-center gap-1.5">
           <Label>Bars</Label>
-          <Input
-            type="number"
-            value={bars}
-            onChange={(e) => setBars(Math.max(1, Math.min(32, Number(e.target.value))))}
-            min="1"
-            max="32"
-            className="w-14 h-7"
-          />
+          <div className="flex items-center bg-secondary border border-border rounded-md h-7">
+            <button
+              className="px-1 h-full text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() => setBars(b => Math.max(1, b - 1))}
+              title="Decrease bars"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+            <input
+              type="text"
+              value={bars}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10)
+                if (!isNaN(v)) setBars(Math.max(1, Math.min(32, v)))
+              }}
+              className="w-8 text-center text-sm bg-transparent text-foreground focus:outline-none [appearance:textfield]"
+            />
+            <button
+              className="px-1 h-full text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() => setBars(b => Math.min(32, b + 1))}
+              title="Increase bars"
+            >
+              <ChevronUp className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
 
         {/* Time division */}
@@ -753,7 +876,7 @@ export default function App() {
         onSnapToGridChange={setSnapToGrid}
         onExportMidi={handleExportMidi}
         onExportWav={handleExportWav}
-        onExportXml={handleExportXml}
+        xmlExportSlot={<ExportXmlDialog onExport={handleExportXml} disabled={isExporting} />}
         onImportMidi={handleImportMidi}
         isExporting={isExporting}
       />
@@ -801,6 +924,28 @@ export default function App() {
                   >
                     <Trash2 className="h-3 w-3 mr-1" /> Clear
                   </Button>
+                  <div className="flex items-center gap-1.5 ml-2" onClick={(e) => e.stopPropagation()}>
+                    <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap">{midiToNote(track.lowestMidi, 'sharp')}</span>
+                    <div className="w-24">
+                      <DualSlider
+                        min={21}
+                        max={108}
+                        value={[track.lowestMidi, track.highestMidi]}
+                        onChange={([low, high]) => updateTrack(track.id, t => ({ ...t, lowestMidi: low, highestMidi: high }))}
+                        minDistance={12}
+                      />
+                    </div>
+                    <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap">{midiToNote(track.highestMidi, 'sharp')}</span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-indigo-400"
+                      onClick={(e) => { e.stopPropagation(); handleFitRange(track.id) }}
+                      title="Fit range to notes"
+                    >
+                      <MoveVertical className="h-3 w-3" />
+                    </Button>
+                  </div>
                 </div>
               </div>
 
@@ -826,7 +971,11 @@ export default function App() {
                   annotationType={annotationType}
                   annotations={trackAnnotations}
                   activeMidiNotes={isActive ? activeMidiNotes : {}}
+                  activeMidiKeysRef={activeMidiKeysRef}
                   scrollSyncRef={scrollSyncRef}
+                  regionStart={regionStart}
+                  regionEnd={regionEnd}
+                  onRegionChange={handleRegionChange}
                   isPasteMode={isPasteMode && pasteTargetTrackId === track.id}
                   pasteClipboard={isPasteMode && pasteTargetTrackId === track.id && clipboardNotesRef.current ? {
                     notes: clipboardNotesRef.current.notes.map(n => ({

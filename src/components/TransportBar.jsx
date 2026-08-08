@@ -21,12 +21,12 @@ export default function TransportBar({
   onSnapToGridChange,
   onExportMidi,
   onExportWav,
-  onExportXml,
+  xmlExportSlot,
   onImportMidi,
   isExporting,
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-3 p-3 border-b border-border bg-card/80 backdrop-blur-sm">
+    <div className="relative z-50 flex flex-wrap items-center gap-3 p-3 border-b border-border bg-card/80 backdrop-blur-sm">
       {/* Transport controls */}
       <div className="flex items-center gap-1.5">
         <Button
@@ -84,9 +84,7 @@ export default function TransportBar({
         <Button variant="outline" size="sm" onClick={onExportWav} disabled={isExporting}>
           <Download className="h-3.5 w-3.5 mr-1" /> WAV
         </Button>
-        <Button variant="outline" size="sm" onClick={onExportXml} disabled={isExporting}>
-          <Download className="h-3.5 w-3.5 mr-1" /> XML
-        </Button>
+        {xmlExportSlot}
       </div>
 
       <div className="h-8 w-px bg-border" />

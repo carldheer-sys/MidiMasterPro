@@ -91,6 +91,20 @@ class AudioEngine {
     }
   }
 
+  setLoopEnabledBeats(enabled, startBeat, endBeat) {
+    if (!Tone.Transport) return
+    Tone.Transport.loop = !!enabled
+    if (enabled) {
+      const startTicks = Math.round(startBeat * Tone.Transport.PPQ)
+      const endTicks = Math.round(endBeat * Tone.Transport.PPQ)
+      Tone.Transport.loopStart = `${startTicks}i`
+      Tone.Transport.loopEnd = `${endTicks}i`
+    } else {
+      Tone.Transport.loopStart = 0
+      Tone.Transport.loopEnd = 0
+    }
+  }
+
   async loadInstrument(instrument, config = {}) {
     if (this.sampler) {
       this.applyInstrumentConfig(config)
@@ -117,10 +131,14 @@ class AudioEngine {
     if (config.release !== undefined) this.sampler.release = config.release
   }
 
-  async start() {
+  async start(atBeat = 0) {
     if (!this.isInitialized) await this.initialize()
     await this.startAudioContext()
     Tone.Transport.position = 0
+    if (atBeat > 0) {
+      const startTicks = Math.round(atBeat * Tone.Transport.PPQ)
+      Tone.Transport.ticks = startTicks
+    }
     Tone.Transport.start()
     this.startPositionTracking()
   }
@@ -256,6 +274,18 @@ class AudioEngine {
       this.stop()
       if (this.onPlaybackComplete) this.onPlaybackComplete()
     }, stopTime)
+  }
+
+  scheduleStopAtBeats(beats) {
+    if (!Tone.Transport) return
+    const stopTicks = Math.round(beats * Tone.Transport.PPQ)
+    if (this.stopEventId !== null) {
+      Tone.Transport.clear(this.stopEventId)
+    }
+    this.stopEventId = Tone.Transport.schedule((time) => {
+      this.stop()
+      if (this.onPlaybackComplete) this.onPlaybackComplete()
+    }, `${stopTicks}i`)
   }
 
   async startMetronome() {

@@ -8,14 +8,10 @@ const DEGREE_MAP = {
   6: '#4', 7: '5', 8: 'b6', 9: '6', 10: 'b7', 11: '7'
 }
 
+const DEGREE_NAMES = ['I', 'bII', 'II', 'bIII', 'III', 'IV', '#IV', 'V', 'bVI', 'VI', 'bVII', 'VII']
+
 const MAJOR_SCALE_SEMITONES = [0, 2, 4, 5, 7, 9, 11]
 const MINOR_SCALE_SEMITONES = [0, 2, 3, 5, 7, 8, 10]
-
-const ROMAN_NUMERALS = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII']
-
-// Expected triad quality at each diatonic scale degree
-const MAJOR_DIATONIC_QUALITIES = ['major', 'minor', 'minor', 'major', 'major', 'minor', 'diminished']
-const MINOR_DIATONIC_QUALITIES = ['minor', 'diminished', 'major', 'minor', 'minor', 'major', 'major']
 
 // ─── Chord detection ──────────────────────────────────────────────────────────
 
@@ -25,11 +21,11 @@ const CHORD_TEMPLATES = [
   { intervals: [0, 4, 7, 10], suffix: '7', quality: 'major' },
   { intervals: [0, 3, 7, 10], suffix: 'm7', quality: 'minor' },
   { intervals: [0, 3, 6, 10], suffix: 'm7b5', quality: 'half-diminished' },
-  { intervals: [0, 3, 6, 9], suffix: 'dim7', quality: 'diminished' },
+  { intervals: [0, 3, 6, 9], suffix: 'o7', quality: 'diminished' },
   { intervals: [0, 4, 7, 9], suffix: '6', quality: 'major' },
   { intervals: [0, 3, 7, 9], suffix: 'm6', quality: 'minor' },
-  { intervals: [0, 4, 8], suffix: 'aug', quality: 'augmented' },
-  { intervals: [0, 3, 6], suffix: 'dim', quality: 'diminished' },
+  { intervals: [0, 4, 8], suffix: '+', quality: 'augmented' },
+  { intervals: [0, 3, 6], suffix: 'o', quality: 'diminished' },
   { intervals: [0, 5, 7], suffix: 'sus4', quality: 'suspended' },
   { intervals: [0, 2, 7], suffix: 'sus2', quality: 'suspended' },
   { intervals: [0, 4, 7], suffix: '', quality: 'major' },
@@ -40,7 +36,7 @@ const CHORD_TEMPLATES = [
  * Detect a chord from a set of pitch classes.
  * Returns { root, suffix, quality, chord_label } or null.
  */
-function detectChord(pitchClasses) {
+function detectChord(pitchClasses, key, mode, bassPc) {
   if (!pitchClasses || pitchClasses.length === 0) return null
   const pcs = [...new Set(pitchClasses)].sort((a, b) => a - b)
   if (pcs.length < 2) return null
@@ -62,14 +58,22 @@ function detectChord(pitchClasses) {
       if (score > bestScore) {
         bestScore = score
         bestMatch = { rootPc, suffix: template.suffix, quality: template.quality }
+      } else if (score === bestScore && bestMatch) {
+        // Tiebreaker: prefer root matching bass note, then lower pitch class
+        const bestIsBass = bestMatch.rootPc === bassPc
+        const candIsBass = rootPc === bassPc
+        if (candIsBass && !bestIsBass) {
+          bestMatch = { rootPc, suffix: template.suffix, quality: template.quality }
+        } else if (!candIsBass && !bestIsBass && rootPc < bestMatch.rootPc) {
+          bestMatch = { rootPc, suffix: template.suffix, quality: template.quality }
+        }
       }
     }
   }
 
   if (!bestMatch) return null
 
-  const naming = 'sharp'
-  const rootName = SEMITONE_TO_SHARP[bestMatch.rootPc]
+  const rootName = getEnharmonicNoteName(bestMatch.rootPc, key, mode)
   const chordLabel = `${rootName}${bestMatch.suffix}`
 
   return {
@@ -82,96 +86,37 @@ function detectChord(pitchClasses) {
 
 /**
  * Convert a detected chord to a roman numeral based on the key.
+ * Base degree is mode-independent (from DEGREE_NAMES).
+ * Case is determined by chord quality, not by expected diatonic quality.
  */
 function chordToRomanNumeral(chord, key, mode) {
   if (!chord) return ''
   const tonicPc = noteNameToSemitone(key) >= 0 ? noteNameToSemitone(key) : 0
-  const rootPc = chord.root
-  const chromaticDistance = (rootPc - tonicPc + 12) % 12
+  const chromaticDistance = (chord.root - tonicPc + 12) % 12
 
-  const scaleSemitones = mode === 'Minor' ? MINOR_SCALE_SEMITONES : MAJOR_SCALE_SEMITONES
-  const diatonicQualities = mode === 'Minor' ? MINOR_DIATONIC_QUALITIES : MAJOR_DIATONIC_QUALITIES
+  const baseDegree = DEGREE_NAMES[chromaticDistance]
 
-  const scaleIdx = scaleSemitones.indexOf(chromaticDistance)
+  // Separate accidental prefix from numeral part
+  const accidental = baseDegree[0] === 'b' || baseDegree[0] === '#' ? baseDegree[0] : ''
+  const numeralPart = accidental ? baseDegree.slice(1) : baseDegree
 
-  let romanNumeral = ''
+  // Determine case from chord quality (conventions §5.2)
+  const isMajor = chord.quality === 'major' || chord.quality === 'augmented' || chord.quality === 'suspended'
+  const numeral = accidental + (isMajor ? numeralPart.toUpperCase() : numeralPart.toLowerCase())
 
-  if (scaleIdx !== -1) {
-    const baseNumeral = ROMAN_NUMERALS[scaleIdx]
-    const expectedQuality = diatonicQualities[scaleIdx]
-    const isMajor = chord.quality === 'major' || chord.quality === 'augmented'
-    const isMinor = chord.quality === 'minor' || chord.quality === 'diminished' || chord.quality === 'half-diminished'
+  // Build extension from suffix (conventions §5.3)
+  let extension = ''
+  if (chord.suffix === 'o') extension = 'o'
+  else if (chord.suffix === 'o7') extension = 'o7'
+  else if (chord.suffix === '+') extension = '+'
+  else if (chord.suffix === 'm7b5') extension = 'm7b5'
+  else if (chord.suffix === '7') extension = '7'
+  else if (chord.suffix === 'maj7') extension = 'maj7'
+  else if (chord.suffix === 'm7') extension = '7'
+  else if (chord.suffix === '6') extension = '6'
+  else if (chord.suffix === 'm6') extension = '6'
 
-    let numeral = baseNumeral
-    if (isMinor && (expectedQuality === 'major' || expectedQuality === 'major')) {
-      numeral = baseNumeral.toLowerCase()
-    } else if (isMajor && (expectedQuality === 'minor' || expectedQuality === 'diminished')) {
-      numeral = baseNumeral.toUpperCase()
-    } else if (chord.quality === 'diminished') {
-      numeral = baseNumeral.toLowerCase()
-    } else if (chord.quality === 'augmented') {
-      numeral = baseNumeral.toUpperCase()
-    } else if (chord.quality === 'minor') {
-      numeral = baseNumeral.toLowerCase()
-    } else {
-      numeral = baseNumeral.toUpperCase()
-    }
-
-    let modifiers = ''
-    if (chord.quality === 'diminished' && chord.suffix === 'dim') modifiers += '\u00B0'
-    if (chord.quality === 'half-diminished') modifiers += '\u00F8'
-    if (chord.quality === 'augmented') modifiers += '+'
-    if (chord.suffix === '7') modifiers += '7'
-    if (chord.suffix === 'maj7') modifiers += 'maj7'
-    if (chord.suffix === 'm7') modifiers += '7'
-    if (chord.suffix === 'dim7') modifiers += '7'
-    if (chord.suffix === 'm7b5') modifiers += '7'
-    if (chord.suffix === '6') modifiers += '6'
-    if (chord.suffix === 'm6') modifiers += '6'
-
-    romanNumeral = numeral + modifiers
-  } else {
-    // Non-diatonic root — use chromatic prefix
-    const nearestIdx = findNearestScaleDegree(chromaticDistance, scaleSemitones)
-    const nearestSemitione = scaleSemitones[nearestIdx]
-    const diff = chromaticDistance - nearestSemitione
-    let prefix = ''
-    if (diff === 1 || diff === -11) prefix = '#'
-    else if (diff === -1 || diff === 11) prefix = 'b'
-    else if (diff > 0) prefix = '#'
-    else prefix = 'b'
-
-    const baseNumeral = ROMAN_NUMERALS[nearestIdx]
-    const isMajor = chord.quality === 'major' || chord.quality === 'augmented'
-    const numeral = isMajor ? baseNumeral.toUpperCase() : baseNumeral.toLowerCase()
-
-    let modifiers = ''
-    if (chord.quality === 'diminished' && chord.suffix === 'dim') modifiers += '\u00B0'
-    if (chord.quality === 'half-diminished') modifiers += '\u00F8'
-    if (chord.quality === 'augmented') modifiers += '+'
-    if (chord.suffix === '7') modifiers += '7'
-    if (chord.suffix === 'maj7') modifiers += 'maj7'
-    if (chord.suffix === 'm7') modifiers += '7'
-    if (chord.suffix === 'dim7') modifiers += '7'
-    if (chord.suffix === 'm7b5') modifiers += '7'
-
-    romanNumeral = prefix + numeral + modifiers
-  }
-
-  return romanNumeral
-}
-
-function findNearestScaleDegree(chromaticDistance, scaleSemitones) {
-  let bestIdx = 0
-  let bestDiff = Infinity
-  for (let i = 0; i < scaleSemitones.length; i++) {
-    const diff = Math.abs(scaleSemitones[i] - chromaticDistance)
-    if (diff < bestDiff) {
-      bestDiff = diff
-      bestIdx = i
-    }
-  }
-  return bestIdx
+  return numeral + extension
 }
 
 // ─── Note name analysis ───────────────────────────────────────────────────────
@@ -322,14 +267,16 @@ export function analyzeAnnotations(notes, key, mode, annotationType) {
         continue
       }
 
-      const chord = detectChord(pitchClasses)
+      const bassPc = Math.min(...groupNotes.map(n => noteToMidi(n.note)).filter(m => m !== null)) % 12
+      const chord = detectChord(pitchClasses, key, mode, bassPc)
       const romanNumeral = chord ? chordToRomanNumeral(chord, key, mode) : ''
 
-      // Determine color: red if non-diatonic
+      // Determine color: red if non-diatonic (all chord tones must be in scale)
       let isDiatonic = true
       if (chord) {
-        const rootDist = (chord.root - tonicPc + 12) % 12
-        isDiatonic = scaleSemitones.includes(rootDist)
+        isDiatonic = pitchClasses.every(pc =>
+          scaleSemitones.includes((pc - tonicPc + 12) % 12)
+        )
       }
 
       events.push({
