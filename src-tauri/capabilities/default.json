@@ -6,8 +6,11 @@
     "core:default",
     "dialog:allow-save",
     "dialog:allow-open",
-    "fs:allow-write-file",
-    "fs:allow-read-file",
-    "fs:allow-create-dir"
+    "fs:write-files",
+    "fs:read-files",
+    {
+      "identifier": "fs:scope",
+      "allow": [{ "path": "**" }]
+    }
   ]
 }
