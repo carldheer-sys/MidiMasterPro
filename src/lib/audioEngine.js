@@ -191,6 +191,8 @@ class AudioEngine {
         if (currentBeat >= beats) {
           loop.stop()
           loop.dispose()
+          Tone.Transport.stop()
+          Tone.Transport.position = 0
           resolve()
           return
         }

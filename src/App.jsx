@@ -45,11 +45,13 @@ export default function App() {
 
   // ─── Project settings ──────────────────────────────────────────────────────
   const [tempo, setTempo] = useState(120)
+  const [tempoInput, setTempoInput] = useState('120')
   const [selectedKey, setSelectedKey] = useState('C')
   const [mode, setMode] = useState('Major')
-  const [bars, setBars] = useState(4)
+  const [bars, setBars] = useState(8)
+  const [barsInput, setBarsInput] = useState('8')
   const [timeSignature, setTimeSignature] = useState({ numerator: 4, denominator: 4 })
-  const [timeDivision, setTimeDivision] = useState('1/4')
+  const [timeDivision, setTimeDivision] = useState('1/8')
   const [annotationType, setAnnotationType] = useState('none')
   const [snapToGrid, setSnapToGrid] = useState(false)
   const [workspaceZoom, setWorkspaceZoom] = useState(1)
@@ -103,6 +105,8 @@ export default function App() {
   useEffect(() => { regionStartRef.current = regionStart }, [regionStart])
   useEffect(() => { regionEndRef.current = regionEnd }, [regionEnd])
   useEffect(() => { setRegionStart(0); setRegionEnd(1) }, [bars])
+  useEffect(() => { setTempoInput(String(tempo)) }, [tempo])
+  useEffect(() => { setBarsInput(String(bars)) }, [bars])
 
   const naming = useMemo(() => getKeyPreferredNaming(selectedKey, mode), [selectedKey, mode])
   useEffect(() => { namingRef.current = naming }, [naming])
@@ -119,7 +123,8 @@ export default function App() {
         audioEngine.onPlaybackComplete = () => {
           setIsPlaying(false)
           setIsRecording(false)
-          setCursorPosition(0)
+          setCursorPosition(regionStartRef.current)
+          playheadProgressRef.current = regionStartRef.current
           commitPendingNotes()
         }
       } catch (err) {
@@ -264,6 +269,8 @@ export default function App() {
       const totalBeats = bars * beatsPerBar
       const startBeat = regionStart * totalBeats
       const endBeat = regionEnd * totalBeats
+      setCursorPosition(regionStart)
+      playheadProgressRef.current = regionStart
       await audioEngine.start(startBeat)
       if (isLooping) {
         audioEngine.setLoopEnabledBeats(true, startBeat, endBeat)
@@ -284,7 +291,8 @@ export default function App() {
     audioEngine.stop()
     audioEngine.stopMetronome()
     audioEngine.clearScheduledNotes()
-    setCursorPosition(0)
+    setCursorPosition(regionStartRef.current)
+    playheadProgressRef.current = regionStartRef.current
   }, [])
 
   const handleRecord = useCallback(async () => {
@@ -307,16 +315,33 @@ export default function App() {
     audioEngine.stop()
     audioEngine.clearScheduledNotes()
 
+    const totalBeats = bars * beatsPerBar
+    const startBeat = regionStart * totalBeats
+    const endBeat = regionEnd * totalBeats
+
+    setCursorPosition(regionStart)
+    playheadProgressRef.current = regionStart
+
     setIsCountingDown(true)
     await audioEngine.playCountdown(1)
     setIsCountingDown(false)
+    const heldNotes = Object.keys(activeMidiKeysRef.current)
+    if (heldNotes.length > 0) {
+      const trackId = activeTrackIdRef.current
+      setActiveMidiNotes(prev => {
+        const updated = { ...prev }
+        for (const noteName of heldNotes) {
+          const noteId = generateId()
+          updated[noteId] = { note: noteName, start: startBeat, id: noteId, trackId }
+        }
+        activeMidiNotesRef.current = updated
+        return updated
+      })
+    }
 
     if (metronomeEnabled) {
       await audioEngine.startMetronome()
     }
-    const totalBeats = bars * beatsPerBar
-    const startBeat = regionStart * totalBeats
-    const endBeat = regionEnd * totalBeats
     scheduleAllNotes()
     await audioEngine.start(startBeat)
     audioEngine.scheduleStopAtBeats(endBeat)
@@ -355,21 +380,10 @@ export default function App() {
   }, [handleNoteAdd])
 
   const handleMidiNoteOn = useCallback((midiNote, velocity) => {
-    const targetTrack = tracksRef.current.find(t => t.id === activeTrackIdRef.current) || tracksRef.current[0]
-    if (!targetTrack) return
+    const trackId = activeTrackIdRef.current
 
     const rawNoteName = Tone.Frequency(midiNote, 'midi').toNote()
     const canonicalNote = canonicalizeNoteName(rawNoteName, namingRef.current)
-
-    // Determine which track based on pitch
-    let trackId = activeTrackIdRef.current
-    const midi = noteToMidi(canonicalNote)
-    if (midi !== null) {
-      if (midi >= 60 && trackId === 'bass') trackId = 'treble'
-      else if (midi < 60 && trackId === 'treble') trackId = 'bass'
-    }
-
-    const targetTrack2 = tracksRef.current.find(t => t.id === trackId) || targetTrack
 
     audioEngine.startNote(canonicalNote, velocity / 127)
 
@@ -453,6 +467,24 @@ export default function App() {
     setRegionStart(start)
     setRegionEnd(end)
   }, [])
+
+  // ─── Snap to grid ──────────────────────────────────────────────────────────
+  const handleSnapToGridChange = useCallback((enabled) => {
+    setSnapToGrid(enabled)
+    if (enabled) {
+      saveHistory()
+      const bpd = beatsPerDivisionFromTimeDivision(timeDivisionRef.current, timeSignatureRef.current)
+      setTracks(prev => prev.map(t => ({
+        ...t,
+        notes: t.notes.map(n => {
+          const snappedStart = Math.round(n.start / bpd) * bpd
+          let snappedDuration = Math.round(n.duration / bpd) * bpd
+          if (snappedDuration < bpd) snappedDuration = bpd
+          return { ...n, start: snappedStart, duration: snappedDuration }
+        }),
+      })))
+    }
+  }, [saveHistory])
 
   // ─── Undo / Redo ───────────────────────────────────────────────────────────
   const handleUndo = useCallback(() => {
@@ -759,10 +791,15 @@ export default function App() {
             </button>
             <input
               type="text"
-              value={tempo}
-              onChange={(e) => {
-                const v = parseInt(e.target.value, 10)
+              value={tempoInput}
+              onChange={(e) => setTempoInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.target.blur()
+              }}
+              onBlur={() => {
+                const v = parseInt(tempoInput, 10)
                 if (!isNaN(v)) setTempo(Math.max(40, Math.min(240, v)))
+                else setTempoInput(String(tempo))
               }}
               className="w-10 text-center text-sm bg-transparent text-foreground focus:outline-none [appearance:textfield]"
             />
@@ -822,10 +859,15 @@ export default function App() {
             </button>
             <input
               type="text"
-              value={bars}
-              onChange={(e) => {
-                const v = parseInt(e.target.value, 10)
+              value={barsInput}
+              onChange={(e) => setBarsInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.target.blur()
+              }}
+              onBlur={() => {
+                const v = parseInt(barsInput, 10)
                 if (!isNaN(v)) setBars(Math.max(1, Math.min(32, v)))
+                else setBarsInput(String(bars))
               }}
               className="w-8 text-center text-sm bg-transparent text-foreground focus:outline-none [appearance:textfield]"
             />
@@ -873,7 +915,7 @@ export default function App() {
         onToggleLoop={() => setIsLooping(!isLooping)}
         onToggleMetronome={() => setMetronomeEnabled(!metronomeEnabled)}
         onAnnotationChange={setAnnotationType}
-        onSnapToGridChange={setSnapToGrid}
+        onSnapToGridChange={handleSnapToGridChange}
         onExportMidi={handleExportMidi}
         onExportWav={handleExportWav}
         xmlExportSlot={<ExportXmlDialog onExport={handleExportXml} disabled={isExporting} />}

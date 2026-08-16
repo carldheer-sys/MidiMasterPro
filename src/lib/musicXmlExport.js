@@ -214,9 +214,161 @@ function getAnnotationAtBeat(annotations, beat) {
   return annotations.find(a => Math.abs(a.start - beat) < 0.01) || null
 }
 
+function assignVoices(sortedGroups) {
+  const voiceEnds = []
+  const groupVoices = new Map()
+
+  sortedGroups.forEach((group, idx) => {
+    const groupEnd = group.start + Math.max(...group.notes.map(n => n.duration))
+    let assigned = -1
+    for (let v = 0; v < voiceEnds.length; v++) {
+      if (voiceEnds[v] <= group.start + EPSILON) {
+        assigned = v
+        voiceEnds[v] = groupEnd
+        break
+      }
+    }
+    if (assigned === -1) {
+      voiceEnds.push(groupEnd)
+      assigned = voiceEnds.length - 1
+    }
+    groupVoices.set(idx, assigned + 1)
+  })
+
+  return groupVoices
+}
+
+function buildVoiceContent(
+  voiceGroups, pendingConts, voiceNum, isFirstVoice,
+  measureStart, measureEnd, actualMeasureBeats,
+  useFlats, annotations, annotationTypes, dedupedAnnotations,
+  totalBeats, beatsPerMeasure
+) {
+  let content = ''
+  let posInMeasure = 0
+  const groupsInMeasure = voiceGroups.filter(g => g.start >= measureStart - EPSILON && g.start < measureEnd - EPSILON)
+  const contsInMeasure = pendingConts.filter(c => c.start >= measureStart - EPSILON && c.start < measureEnd - EPSILON)
+
+  while (posInMeasure < actualMeasureBeats - EPSILON) {
+    const absBeat = measureStart + posInMeasure
+    const groupStartingHere = groupsInMeasure.find(g => Math.abs(g.start - absBeat) < 0.01)
+    const contStartingHere = contsInMeasure.find(c => Math.abs(c.start - absBeat) < 0.01)
+
+    if (groupStartingHere && isFirstVoice && annotations) {
+      const ann = getAnnotationAtBeat(dedupedAnnotations, absBeat)
+      if (ann) {
+        if (annotationTypes.includes('chord_names') && ann.chord_label) {
+          content += buildTextExpressionXml(ann.chord_label, 20) + '\n'
+        }
+        if (annotationTypes.includes('roman_numerals') && ann.roman_numeral) {
+          content += buildTextExpressionXml(ann.roman_numeral, -40) + '\n'
+        }
+      }
+    }
+
+    if (groupStartingHere) {
+      const notesAtBeat = groupStartingHere.notes
+      const isChord = notesAtBeat.length > 1
+      const sortedNotes = [...notesAtBeat].sort((a, b) => noteToMidi(a.note) - noteToMidi(b.note))
+      const firstNote = sortedNotes[0]
+      const noteEnd = firstNote.start + firstNote.duration
+      const crossesBoundary = noteEnd > measureEnd + EPSILON
+
+      let scaleDegreeLyric = null
+      if (annotationTypes.includes('scale_degrees') && annotations) {
+        const ann = getAnnotationAtBeat(dedupedAnnotations, absBeat)
+        if (ann && ann.scale_degree) scaleDegreeLyric = ann.scale_degree
+      }
+
+      if (crossesBoundary) {
+        const durationInCurrent = measureEnd - absBeat
+        const segments = splitDurationIntoSegments(durationInCurrent)
+        for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+          const seg = segments[segIdx]
+          let segTieType = 'start'
+          if (segments.length > 1 && segIdx > 0) segTieType = 'continue'
+          for (let i = 0; i < sortedNotes.length; i++) {
+            const pitch = parseNoteToXmlPitch(sortedNotes[i].note, useFlats)
+            if (pitch) {
+              const lyric = (segIdx === 0 && i === 0) ? scaleDegreeLyric : null
+              content += buildNoteXml(pitch, seg.beats, seg.type, voiceNum, isChord && i > 0, seg.dots, segTieType, lyric) + '\n'
+            }
+          }
+        }
+        posInMeasure = actualMeasureBeats
+        let remainingStart = measureEnd
+        let remainingDuration = noteEnd - measureEnd
+        while (remainingDuration > EPSILON) {
+          const nextMeasureIdx = Math.floor(remainingStart / beatsPerMeasure)
+          const nextMeasureEnd = Math.min((nextMeasureIdx + 1) * beatsPerMeasure, totalBeats)
+          const contDuration = Math.min(remainingDuration, nextMeasureEnd - remainingStart)
+          const isFinal = r6(remainingDuration - contDuration) < EPSILON
+          pendingConts.push({ start: remainingStart, duration: contDuration, notes: notesAtBeat, isFinalSegment: isFinal })
+          remainingStart = r6(remainingStart + contDuration)
+          remainingDuration = r6(remainingDuration - contDuration)
+        }
+      } else {
+        const durationInMeasure = noteEnd - absBeat
+        const segments = splitDurationIntoSegments(durationInMeasure)
+        for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+          const seg = segments[segIdx]
+          let segTieType = null
+          if (segments.length > 1) {
+            if (segIdx === 0) segTieType = 'start'
+            else if (segIdx === segments.length - 1) segTieType = 'stop'
+            else segTieType = 'continue'
+          }
+          for (let i = 0; i < sortedNotes.length; i++) {
+            const pitch = parseNoteToXmlPitch(sortedNotes[i].note, useFlats)
+            if (pitch) {
+              const lyric = (segIdx === 0 && i === 0) ? scaleDegreeLyric : null
+              content += buildNoteXml(pitch, seg.beats, seg.type, voiceNum, isChord && i > 0, seg.dots, segTieType, lyric) + '\n'
+            }
+          }
+        }
+        posInMeasure = noteEnd - measureStart
+      }
+    } else if (contStartingHere) {
+      const cont = contStartingHere
+      const sortedNotes = [...cont.notes].sort((a, b) => noteToMidi(a.note) - noteToMidi(b.note))
+      const isChord = sortedNotes.length > 1
+      const segments = splitDurationIntoSegments(cont.duration)
+      for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+        const seg = segments[segIdx]
+        let segTieType = 'continue'
+        if (cont.isFinalSegment && segIdx === segments.length - 1) segTieType = 'stop'
+        else if (cont.isFinalSegment && segments.length === 1) segTieType = 'stop'
+        for (let i = 0; i < sortedNotes.length; i++) {
+          const pitch = parseNoteToXmlPitch(sortedNotes[i].note, useFlats)
+          if (pitch) {
+            content += buildNoteXml(pitch, seg.beats, seg.type, voiceNum, isChord && i > 0, seg.dots, segTieType) + '\n'
+          }
+        }
+      }
+      posInMeasure = (cont.start + cont.duration) - measureStart
+    } else {
+      const nextGroupStart = voiceGroups.find(g => g.start > absBeat + EPSILON)?.start
+      const nextContStart = pendingConts.find(c => c.start > absBeat + EPSILON)?.start
+      const candidates = [nextGroupStart, nextContStart].filter(v => v !== undefined)
+      const nextStart = candidates.length > 0 ? Math.min(...candidates) : measureEnd
+      const restEnd = Math.min(nextStart, measureEnd)
+      const restDuration = restEnd - absBeat
+      if (restDuration > EPSILON) {
+        const segments = splitDurationIntoSegments(restDuration)
+        for (const seg of segments) {
+          content += buildRestXml(seg.beats, seg.type, voiceNum, seg.dots) + '\n'
+        }
+      }
+      posInMeasure = restEnd - measureStart
+    }
+  }
+
+  return content
+}
+
 function buildStaffForPart(notes, options) {
   const {
-    clefSign, clefLine, voice, keyFifths, beatsPerMeasure, beatType, timeBeats,
+    clefSign, clefLine, keyFifths, beatsPerMeasure, beatType, timeBeats,
     useFlats, annotations, annotationTypes, totalBeats, tempo, includeTempo = true
   } = options
 
@@ -236,6 +388,20 @@ function buildStaffForPart(notes, options) {
     .map(([startStr, ns]) => ({ start: parseFloat(startStr), notes: ns }))
     .sort((a, b) => a.start - b.start)
 
+  const groupVoiceMap = assignVoices(sortedGroups)
+  const numVoices = sortedGroups.length > 0 ? Math.max(...groupVoiceMap.values()) : 1
+
+  const groupsByVoice = {}
+  const pendingContsByVoice = {}
+  for (let v = 1; v <= numVoices; v++) {
+    groupsByVoice[v] = []
+    pendingContsByVoice[v] = []
+  }
+  sortedGroups.forEach((group, idx) => {
+    const v = groupVoiceMap.get(idx)
+    groupsByVoice[v].push(group)
+  })
+
   const dedupedAnnotations = []
   const seenStarts = new Set()
   if (annotations) {
@@ -249,7 +415,6 @@ function buildStaffForPart(notes, options) {
     }
   }
 
-  let pendingContinuations = []
   let xml = ''
   let measureNum = 1
 
@@ -267,121 +432,15 @@ function buildStaffForPart(notes, options) {
       }
     }
 
-    let posInMeasure = 0
-    const groupsInMeasure = sortedGroups.filter(g => g.start >= measureStart - EPSILON && g.start < measureEnd - EPSILON)
-    const contsInMeasure = pendingContinuations.filter(c => c.start >= measureStart - EPSILON && c.start < measureEnd - EPSILON)
-
-    while (posInMeasure < actualMeasureBeats - EPSILON) {
-      const absBeat = measureStart + posInMeasure
-      const groupStartingHere = groupsInMeasure.find(g => Math.abs(g.start - absBeat) < 0.01)
-      const contStartingHere = contsInMeasure.find(c => Math.abs(c.start - absBeat) < 0.01)
-
-      if (groupStartingHere && annotations) {
-        const ann = getAnnotationAtBeat(dedupedAnnotations, absBeat)
-        if (ann) {
-          if (annotationTypes.includes('chord_names') && ann.chord_label) {
-            measureContent += buildHarmonyXml(ann.chord_label) + '\n'
-          }
-          if (annotationTypes.includes('roman_numerals') && ann.roman_numeral) {
-            measureContent += buildTextExpressionXml(ann.roman_numeral, -40) + '\n'
-          }
-        }
-      }
-
-      if (groupStartingHere) {
-        const notesAtBeat = groupStartingHere.notes
-        const isChord = notesAtBeat.length > 1
-        const sortedNotes = [...notesAtBeat].sort((a, b) => noteToMidi(a.note) - noteToMidi(b.note))
-        const firstNote = sortedNotes[0]
-        const noteEnd = firstNote.start + firstNote.duration
-        const crossesBoundary = noteEnd > measureEnd + EPSILON
-
-        let scaleDegreeLyric = null
-        if (annotationTypes.includes('scale_degrees') && annotations) {
-          const ann = getAnnotationAtBeat(dedupedAnnotations, absBeat)
-          if (ann && ann.scale_degree) scaleDegreeLyric = ann.scale_degree
-        }
-
-        if (crossesBoundary) {
-          const durationInCurrent = measureEnd - absBeat
-          const segments = splitDurationIntoSegments(durationInCurrent)
-          for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-            const seg = segments[segIdx]
-            let segTieType = 'start'
-            if (segments.length > 1 && segIdx > 0) segTieType = 'continue'
-            for (let i = 0; i < sortedNotes.length; i++) {
-              const pitch = parseNoteToXmlPitch(sortedNotes[i].note, useFlats)
-              if (pitch) {
-                const lyric = (segIdx === 0 && i === 0) ? scaleDegreeLyric : null
-                measureContent += buildNoteXml(pitch, seg.beats, seg.type, voice, isChord && i > 0, seg.dots, segTieType, lyric) + '\n'
-              }
-            }
-          }
-          posInMeasure = actualMeasureBeats
-          let remainingStart = measureEnd
-          let remainingDuration = noteEnd - measureEnd
-          while (remainingDuration > EPSILON) {
-            const nextMeasureIdx = Math.floor(remainingStart / beatsPerMeasure)
-            const nextMeasureEnd = Math.min((nextMeasureIdx + 1) * beatsPerMeasure, totalBeats)
-            const contDuration = Math.min(remainingDuration, nextMeasureEnd - remainingStart)
-            const isFinal = r6(remainingDuration - contDuration) < EPSILON
-            pendingContinuations.push({ start: remainingStart, duration: contDuration, notes: notesAtBeat, isFinalSegment: isFinal })
-            remainingStart = r6(remainingStart + contDuration)
-            remainingDuration = r6(remainingDuration - contDuration)
-          }
-        } else {
-          const durationInMeasure = noteEnd - absBeat
-          const segments = splitDurationIntoSegments(durationInMeasure)
-          for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-            const seg = segments[segIdx]
-            let segTieType = null
-            if (segments.length > 1) {
-              if (segIdx === 0) segTieType = 'start'
-              else if (segIdx === segments.length - 1) segTieType = 'stop'
-              else segTieType = 'continue'
-            }
-            for (let i = 0; i < sortedNotes.length; i++) {
-              const pitch = parseNoteToXmlPitch(sortedNotes[i].note, useFlats)
-              if (pitch) {
-                const lyric = (segIdx === 0 && i === 0) ? scaleDegreeLyric : null
-                measureContent += buildNoteXml(pitch, seg.beats, seg.type, voice, isChord && i > 0, seg.dots, segTieType, lyric) + '\n'
-              }
-            }
-          }
-          posInMeasure = noteEnd - measureStart
-        }
-      } else if (contStartingHere) {
-        const cont = contStartingHere
-        const sortedNotes = [...cont.notes].sort((a, b) => noteToMidi(a.note) - noteToMidi(b.note))
-        const isChord = sortedNotes.length > 1
-        const segments = splitDurationIntoSegments(cont.duration)
-        for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-          const seg = segments[segIdx]
-          let segTieType = 'continue'
-          if (cont.isFinalSegment && segIdx === segments.length - 1) segTieType = 'stop'
-          else if (cont.isFinalSegment && segments.length === 1) segTieType = 'stop'
-          for (let i = 0; i < sortedNotes.length; i++) {
-            const pitch = parseNoteToXmlPitch(sortedNotes[i].note, useFlats)
-            if (pitch) {
-              measureContent += buildNoteXml(pitch, seg.beats, seg.type, voice, isChord && i > 0, seg.dots, segTieType) + '\n'
-            }
-          }
-        }
-        posInMeasure = (cont.start + cont.duration) - measureStart
-      } else {
-        const nextGroupStart = sortedGroups.find(g => g.start > absBeat + EPSILON)?.start
-        const nextContStart = pendingContinuations.find(c => c.start > absBeat + EPSILON)?.start
-        const candidates = [nextGroupStart, nextContStart].filter(v => v !== undefined)
-        const nextStart = candidates.length > 0 ? Math.min(...candidates) : measureEnd
-        const restEnd = Math.min(nextStart, measureEnd)
-        const restDuration = restEnd - absBeat
-        if (restDuration > EPSILON) {
-          const segments = splitDurationIntoSegments(restDuration)
-          for (const seg of segments) {
-            measureContent += buildRestXml(seg.beats, seg.type, voice, seg.dots) + '\n'
-          }
-        }
-        posInMeasure = restEnd - measureStart
+    for (let v = 1; v <= numVoices; v++) {
+      measureContent += buildVoiceContent(
+        groupsByVoice[v], pendingContsByVoice[v], v, v === 1,
+        measureStart, measureEnd, actualMeasureBeats,
+        useFlats, annotations, annotationTypes, dedupedAnnotations,
+        totalBeats, beatsPerMeasure
+      )
+      if (v < numVoices) {
+        measureContent += `      <backup><duration>${beatsToDuration(actualMeasureBeats)}</duration></backup>\n`
       }
     }
 

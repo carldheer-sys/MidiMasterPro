@@ -116,8 +116,14 @@ export default function PianoRoll({
         playheadRef.current.style.transform = `translateX(${progress * gridWidth}px)`
       }
       const activeKeys = activeMidiKeysRef.current
+      const activeMidis = new Set()
+      for (const k of Object.keys(activeKeys)) {
+        const m = noteToMidi(k)
+        if (m !== null) activeMidis.add(m)
+      }
       keyGlowRefs.current.forEach((el, notePitch) => {
-        el.style.opacity = activeKeys[notePitch] ? '1' : '0'
+        const midi = localNoteToMidi(notePitch)
+        el.style.opacity = activeMidis.has(midi) ? '1' : '0'
       })
       rafRef.current = requestAnimationFrame(tick)
     }
