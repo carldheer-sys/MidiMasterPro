@@ -70,8 +70,8 @@ class AudioEngine {
     }
   }
 
-  setBufferSize(size) {
-    if (Tone.context) Tone.context.lookAhead = size > 256 ? 0.1 : 0.05
+  setLookAhead(value) {
+    if (Tone.context) Tone.context.lookAhead = value
   }
 
   setLoopLength(bars) {
@@ -210,7 +210,7 @@ class AudioEngine {
     try {
       await this.startAudioContext()
       if (this.sampler) {
-        this.sampler.triggerAttackRelease(noteName, duration, Tone.now() + 0.02, 0.8)
+        this.sampler.triggerAttackRelease(noteName, duration, Tone.now(), 0.8)
       }
     } catch (error) {
       console.warn('Failed to play note:', error)
@@ -221,7 +221,7 @@ class AudioEngine {
     if (!this.isInitialized) return
     try {
       if (this.sampler) {
-        this.sampler.triggerAttack(noteName, Tone.now() + 0.02, Math.min(Math.max(velocity, 0), 1))
+        this.sampler.triggerAttack(noteName, Tone.now(), Math.min(Math.max(velocity, 0), 1))
       }
     } catch (error) {
       console.warn('Failed to start note:', error)
@@ -232,7 +232,7 @@ class AudioEngine {
     if (!this.isInitialized) return
     try {
       if (this.sampler) {
-        this.sampler.triggerRelease(noteName, Tone.now() + 0.02)
+        this.sampler.triggerRelease(noteName, Tone.now())
       }
     } catch (error) {
       console.warn('Failed to stop note:', error)

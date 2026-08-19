@@ -57,6 +57,7 @@ export default function App() {
   const [workspaceZoom, setWorkspaceZoom] = useState(1)
   const [regionStart, setRegionStart] = useState(0)
   const [regionEnd, setRegionEnd] = useState(1)
+  const [latencyMode, setLatencyMode] = useState('normal')
 
   // ─── Tracks ────────────────────────────────────────────────────────────────
   const [tracks, setTracks] = useState([
@@ -107,6 +108,9 @@ export default function App() {
   useEffect(() => { setRegionStart(0); setRegionEnd(1) }, [bars])
   useEffect(() => { setTempoInput(String(tempo)) }, [tempo])
   useEffect(() => { setBarsInput(String(bars)) }, [bars])
+
+  const latencyMap = { low: 0.02, normal: 0.05, high: 0.1 }
+  useEffect(() => { audioEngine.setLookAhead(latencyMap[latencyMode]) }, [latencyMode])
 
   const naming = useMemo(() => getKeyPreferredNaming(selectedKey, mode), [selectedKey, mode])
   useEffect(() => { namingRef.current = naming }, [naming])
@@ -819,7 +823,7 @@ export default function App() {
         {/* Key & Mode */}
         <div className="flex items-center gap-1.5">
           <Label>Key</Label>
-          <Select value={selectedKey} onChange={(e) => setSelectedKey(e.target.value)} className="w-16 h-7">
+          <Select value={selectedKey} onChange={(e) => setSelectedKey(e.target.value)} className="w-20 h-7">
             {KEYS.map(k => <option key={k} value={k}>{k}</option>)}
           </Select>
           <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-20 h-7">
@@ -838,7 +842,7 @@ export default function App() {
               const preset = TIME_SIGNATURE_PRESETS.find(p => p.label === e.target.value)
               if (preset) setTimeSignature({ numerator: preset.numerator, denominator: preset.denominator })
             }}
-            className="w-16 h-7"
+            className="w-20 h-7"
           >
             {TIME_SIGNATURE_PRESETS.map(ts => (
               <option key={ts.label} value={ts.label}>{ts.label}</option>
@@ -884,8 +888,20 @@ export default function App() {
         {/* Time division */}
         <div className="flex items-center gap-1.5">
           <Label>Grid</Label>
-          <Select value={timeDivision} onChange={(e) => setTimeDivision(e.target.value)} className="w-16 h-7">
+          <Select value={timeDivision} onChange={(e) => setTimeDivision(e.target.value)} className="w-20 h-7">
             {TIME_DIVISIONS.map(td => <option key={td} value={td}>{td}</option>)}
+          </Select>
+        </div>
+
+        <div className="h-8 w-px bg-border" />
+
+        {/* Latency */}
+        <div className="flex items-center gap-1.5">
+          <Label>Latency</Label>
+          <Select value={latencyMode} onChange={(e) => setLatencyMode(e.target.value)} className="w-24 h-7">
+            <option value="low">Low</option>
+            <option value="normal">Normal</option>
+            <option value="high">High</option>
           </Select>
         </div>
 
