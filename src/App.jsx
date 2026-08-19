@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import * as Tone from 'tone'
-import { Undo2, Redo2, Trash2, ChevronDown, ChevronRight, ChevronUp, Download, Upload, MoveVertical } from 'lucide-react'
+import { Trash2, ChevronDown, ChevronRight, ChevronUp, Download, Upload, MoveVertical } from 'lucide-react'
 import PianoRoll from './components/PianoRoll'
 import TransportBar from './components/TransportBar'
 import ExportXmlDialog from './components/ExportXmlDialog'
@@ -57,7 +57,7 @@ export default function App() {
   const [workspaceZoom, setWorkspaceZoom] = useState(1)
   const [regionStart, setRegionStart] = useState(0)
   const [regionEnd, setRegionEnd] = useState(1)
-  const [latencyMode, setLatencyMode] = useState('normal')
+  const [latencyMode, setLatencyMode] = useState('low')
 
   // ─── Tracks ────────────────────────────────────────────────────────────────
   const [tracks, setTracks] = useState([
@@ -492,24 +492,20 @@ export default function App() {
 
   // ─── Undo / Redo ───────────────────────────────────────────────────────────
   const handleUndo = useCallback(() => {
-    setHistory(prev => {
-      if (prev.length === 0) return prev
-      const last = prev[prev.length - 1]
-      setRedoStack(r => [...r, { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
-      setTracks(last.tracks)
-      return prev.slice(0, -1)
-    })
-  }, [])
+    if (history.length === 0) return
+    const last = history[history.length - 1]
+    setRedoStack(r => [...r, { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
+    setTracks(last.tracks)
+    setHistory(prev => prev.slice(0, -1))
+  }, [history])
 
   const handleRedo = useCallback(() => {
-    setRedoStack(prev => {
-      if (prev.length === 0) return prev
-      const next = prev[prev.length - 1]
-      setHistory(h => [...h, { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
-      setTracks(next.tracks)
-      return prev.slice(0, -1)
-    })
-  }, [])
+    if (redoStack.length === 0) return
+    const next = redoStack[redoStack.length - 1]
+    setHistory(h => [...h, { tracks: tracksRef.current.map(t => ({ ...t, notes: [...t.notes] })) }])
+    setTracks(next.tracks)
+    setRedoStack(prev => prev.slice(0, -1))
+  }, [redoStack])
 
   // ─── Clear track ───────────────────────────────────────────────────────────
   const handleClearTrack = useCallback((trackId) => {
@@ -823,10 +819,10 @@ export default function App() {
         {/* Key & Mode */}
         <div className="flex items-center gap-1.5">
           <Label>Key</Label>
-          <Select value={selectedKey} onChange={(e) => setSelectedKey(e.target.value)} className="w-20 h-7">
+          <Select value={selectedKey} onChange={(e) => setSelectedKey(e.target.value)} className="w-16 h-7">
             {KEYS.map(k => <option key={k} value={k}>{k}</option>)}
           </Select>
-          <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-20 h-7">
+          <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-28 h-7">
             {MODES.map(m => <option key={m} value={m}>{m}</option>)}
           </Select>
         </div>
@@ -906,15 +902,6 @@ export default function App() {
         </div>
 
         <div className="flex-1" />
-
-        <div className="flex items-center gap-1.5">
-          <Button variant="ghost" size="icon" onClick={handleUndo} title="Undo (Ctrl+Z)">
-            <Undo2 className="h-4 w-4" />
-          </Button>
-          <Button variant="ghost" size="icon" onClick={handleRedo} title="Redo (Ctrl+Shift+Z)">
-            <Redo2 className="h-4 w-4" />
-          </Button>
-        </div>
       </div>
 
       {/* Transport bar */}
@@ -932,6 +919,10 @@ export default function App() {
         onToggleMetronome={() => setMetronomeEnabled(!metronomeEnabled)}
         onAnnotationChange={setAnnotationType}
         onSnapToGridChange={handleSnapToGridChange}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
+        canUndo={history.length > 0}
+        canRedo={redoStack.length > 0}
         onExportMidi={handleExportMidi}
         onExportWav={handleExportWav}
         xmlExportSlot={<ExportXmlDialog onExport={handleExportXml} disabled={isExporting} />}
@@ -1049,6 +1040,7 @@ export default function App() {
                   onNoteDelete={(noteId) => handleNoteDelete(track.id, noteId)}
                   onNotesSelect={(noteIds, exclusive) => handleNotesSelect(track.id, noteIds, exclusive)}
                   onNotePlay={handleNotePlay}
+                  onDragStart={saveHistory}
                 />
               </div>
               )}

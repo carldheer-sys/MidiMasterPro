@@ -69,6 +69,7 @@ export default function PianoRoll({
   onNoteDelete,
   onNotesSelect,
   onNotePlay,
+  onDragStart,
   scrollSyncRef,
   regionStart = 0,
   regionEnd = 1,
@@ -90,6 +91,7 @@ export default function PianoRoll({
   const marqueeRef = useRef(null)
   const keyGlowRefs = useRef(new Map())
   const regionDragRef = useRef(null)
+  const zoomScrollRef = useRef(null)
 
   const beatWidth = INITIAL_BEAT_WIDTH * zoom
   const barWidth = beatsPerBar * beatWidth
@@ -151,13 +153,30 @@ export default function PianoRoll({
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
         e.preventDefault()
         const delta = e.deltaY > 0 ? 0.9 : 1.1
-        if (onZoomChange) onZoomChange(Math.max(0.5, Math.min(3, zoomRef.current * delta)))
+        const newZoom = Math.max(0.5, Math.min(3, zoomRef.current * delta))
+        if (onZoomChange && newZoom !== zoomRef.current) {
+          const rect = el.getBoundingClientRect()
+          const mouseX = e.clientX - rect.left
+          const beatAtMouse = (el.scrollLeft + mouseX - KEYBOARD_WIDTH) / (INITIAL_BEAT_WIDTH * zoomRef.current)
+          zoomScrollRef.current = { beatAtMouse, mouseX }
+          onZoomChange(newZoom)
+        }
       }
     }
 
     el.addEventListener('wheel', handleWheel, { passive: false })
     return () => el.removeEventListener('wheel', handleWheel)
   }, [onZoomChange])
+
+  // Preserve scroll position after zoom re-renders
+  useEffect(() => {
+    if (zoomScrollRef.current === null) return
+    const el = containerRef.current
+    if (!el) return
+    const { beatAtMouse, mouseX } = zoomScrollRef.current
+    el.scrollLeft = (KEYBOARD_WIDTH + beatAtMouse * (INITIAL_BEAT_WIDTH * zoom)) - mouseX
+    zoomScrollRef.current = null
+  }, [zoom])
 
   // Register container for scroll sync and handle scroll events
   useEffect(() => {
@@ -303,8 +322,8 @@ export default function PianoRoll({
 
     const noteIndex = noteIndexMap.get(localNoteToMidi(noteData.note)) ?? 0
 
-    // Collect all selected notes for multi-note drag (move type only)
-    const selectedNotes = (type === 'move' && isAlreadySelected && !isModifier)
+    // Collect all selected notes for multi-note drag (all drag types)
+    const selectedNotes = (isAlreadySelected && !isModifier)
       ? notes.filter(n => n.selected).map(n => ({
           id: n.id,
           originalStart: n.start,
@@ -334,6 +353,7 @@ export default function PianoRoll({
       const deltaX = e.clientX - dragState.startX
       if (!hasDraggedRef.current && Math.abs(deltaX) > 3) {
         hasDraggedRef.current = true
+        if (onDragStart) onDragStart()
       }
       if (!hasDraggedRef.current) return
 
@@ -365,20 +385,37 @@ export default function PianoRoll({
         }
       }
 
-      if (dragState.type === 'move' && dragState.selectedNotes && dragState.selectedNotes.length > 1 && onNotesUpdate) {
+      if (dragState.selectedNotes && dragState.selectedNotes.length > 1 && onNotesUpdate) {
         const updates = {}
-        const deltaRows = Math.round(deltaY / CELL_HEIGHT)
-        dragState.selectedNotes.forEach(sn => {
-          let snStart = sn.originalStart + deltaBeats
-          if (snapToGrid) snStart = Math.round(snStart / beatsPerDivision) * beatsPerDivision
-          snStart = Math.max(0, snStart)
-          const update = { start: snStart }
-          if (sn.originalNoteIndex !== undefined) {
-            const snNewIndex = Math.max(0, Math.min(noteRange.length - 1, sn.originalNoteIndex + deltaRows))
-            update.note = noteRange[snNewIndex]
-          }
-          updates[sn.id] = update
-        })
+        const minDur = snapToGrid ? beatsPerDivision : 0.1
+        if (dragState.type === 'move') {
+          const deltaRows = Math.round(deltaY / CELL_HEIGHT)
+          dragState.selectedNotes.forEach(sn => {
+            let snStart = sn.originalStart + deltaBeats
+            if (snapToGrid) snStart = Math.round(snStart / beatsPerDivision) * beatsPerDivision
+            snStart = Math.max(0, snStart)
+            const update = { start: snStart }
+            if (sn.originalNoteIndex !== undefined) {
+              const snNewIndex = Math.max(0, Math.min(noteRange.length - 1, sn.originalNoteIndex + deltaRows))
+              update.note = noteRange[snNewIndex]
+            }
+            updates[sn.id] = update
+          })
+        } else if (dragState.type === 'start') {
+          dragState.selectedNotes.forEach(sn => {
+            let rawStart = sn.originalStart + deltaBeats
+            if (snapToGrid) rawStart = Math.round(rawStart / beatsPerDivision) * beatsPerDivision
+            const endPosition = sn.originalStart + sn.originalDuration
+            const snStart = Math.max(0, Math.min(rawStart, endPosition - minDur))
+            updates[sn.id] = { start: snStart, duration: endPosition - snStart }
+          })
+        } else if (dragState.type === 'end') {
+          dragState.selectedNotes.forEach(sn => {
+            let rawDuration = sn.originalDuration + deltaBeats
+            if (snapToGrid) rawDuration = Math.round(rawDuration / beatsPerDivision) * beatsPerDivision
+            updates[sn.id] = { duration: Math.max(minDur, rawDuration) }
+          })
+        }
         onNotesUpdate(updates)
       } else if (onNoteUpdate) {
         onNoteUpdate(dragState.id, { start: newStart, duration: newDuration, ...(newNoteName && { note: newNoteName }) })
@@ -396,7 +433,7 @@ export default function PianoRoll({
       window.removeEventListener('mousemove', handleMouseMove)
       window.removeEventListener('mouseup', handleMouseUp)
     }
-  }, [dragState, beatWidth, zoom, snapToGrid, onNoteUpdate, onNotesUpdate, beatsPerDivision, noteRange])
+  }, [dragState, beatWidth, zoom, snapToGrid, onNoteUpdate, onNotesUpdate, onDragStart, beatsPerDivision, noteRange])
 
   // Marquee selection
   useEffect(() => {

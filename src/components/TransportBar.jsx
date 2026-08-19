@@ -1,4 +1,4 @@
-import { Play, Square, Circle, Repeat, Download, Upload } from 'lucide-react'
+import { Play, Square, Circle, Repeat, Download, Upload, Undo2, Redo2 } from 'lucide-react'
 import { Button } from './ui/button'
 import { Select } from './ui/select'
 import { Label } from './ui/label'
@@ -19,6 +19,10 @@ export default function TransportBar({
   onToggleMetronome,
   onAnnotationChange,
   onSnapToGridChange,
+  onUndo,
+  onRedo,
+  canUndo,
+  canRedo,
   onExportMidi,
   onExportWav,
   xmlExportSlot,
@@ -107,6 +111,16 @@ export default function TransportBar({
         />
         <Label>Snap</Label>
       </label>
+
+      {/* Undo / Redo */}
+      <div className="flex items-center gap-1.5">
+        <Button variant="ghost" size="icon" onClick={onUndo} disabled={!canUndo} title="Undo (Ctrl+Z)">
+          <Undo2 className="h-4 w-4" />
+        </Button>
+        <Button variant="ghost" size="icon" onClick={onRedo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)">
+          <Redo2 className="h-4 w-4" />
+        </Button>
+      </div>
     </div>
   )
 }
