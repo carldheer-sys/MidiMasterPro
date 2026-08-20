@@ -526,13 +526,13 @@ export default function App() {
   // ─── Export / Import ───────────────────────────────────────────────────────
   const handleExportMidi = useCallback(async () => {
     try {
-      const blob = exportToMidi(tracks, tempo, timeDivision, timeSignature)
+      const blob = exportToMidi(tracks, tempo, timeDivision, timeSignature, selectedKey, mode)
       await saveBlob(blob, 'my_composition.mid', ['mid'], 'MIDI files')
     } catch (err) {
       console.error('MIDI export failed:', err)
       alert('MIDI export failed: ' + err.message)
     }
-  }, [tracks, tempo, timeDivision, timeSignature])
+  }, [tracks, tempo, timeDivision, timeSignature, selectedKey, mode])
 
   const handleExportWav = useCallback(async () => {
     setIsExporting(true)
@@ -643,6 +643,8 @@ export default function App() {
         if (result.timeDivision) setTimeDivision(result.timeDivision)
         if (result.timeSignature) setTimeSignature(result.timeSignature)
         if (result.tempo) setTempo(result.tempo)
+        if (result.key) setSelectedKey(result.key)
+        if (result.mode) setMode(result.mode)
       } catch (err) {
         console.error('MIDI import failed:', err)
         alert('MIDI import failed: ' + err.message)
@@ -822,7 +824,7 @@ export default function App() {
           <Select value={selectedKey} onChange={(e) => setSelectedKey(e.target.value)} className="w-16 h-7">
             {KEYS.map(k => <option key={k} value={k}>{k}</option>)}
           </Select>
-          <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-28 h-7">
+          <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-24 h-7">
             {MODES.map(m => <option key={m} value={m}>{m}</option>)}
           </Select>
         </div>

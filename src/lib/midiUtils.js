@@ -85,7 +85,7 @@ export const calculateTimeDivision = (minDurationBeats) => {
   return '1/1'
 }
 
-export const exportToMidi = (tracks, tempo, timeDivision, timeSignature = DEFAULT_TIME_SIGNATURE) => {
+export const exportToMidi = (tracks, tempo, timeDivision, timeSignature = DEFAULT_TIME_SIGNATURE, key, mode) => {
   const midi = new Midi()
   const normalizedTimeSignature = normalizeTimeSignature(timeSignature)
   const internalTempo = getInternalBpm(tempo, normalizedTimeSignature)
@@ -96,6 +96,13 @@ export const exportToMidi = (tracks, tempo, timeDivision, timeSignature = DEFAUL
       timeSignature: [normalizedTimeSignature.numerator, normalizedTimeSignature.denominator],
       ticks: 0
     })
+    if (key) {
+      midi.header.keySignatures.push({
+        key,
+        scale: mode === 'Minor' ? 'minor' : 'major',
+        ticks: 0
+      })
+    }
   }
 
   const ticksPerBeat = midi.header?.ppq || 480
@@ -134,6 +141,7 @@ export const importFromMidi = async (arrayBuffer, currentTempo) => {
     const midiTempoFromHeader = midi.header?.tempos?.length > 0 ? midi.header.tempos[0].bpm : null
     const midiTempo = midiTempoFromHeader ?? getInternalBpm(currentTempo, timeSignature)
     const projectTempo = getProjectBpm(midiTempo, timeSignature)
+    const keySig = midi.header?.keySignatures?.[0]
 
     const tracksWithNotes = midi.tracks.filter(t => t.notes.length > 0)
 
@@ -197,7 +205,9 @@ export const importFromMidi = async (arrayBuffer, currentTempo) => {
       bars,
       timeDivision: hasMMPMetadata ? timeDivision : calculatedTimeDivision,
       timeSignature,
-      tempo: projectTempo
+      tempo: projectTempo,
+      key: keySig?.key || null,
+      mode: keySig?.scale === 'minor' ? 'Minor' : (keySig?.scale === 'major' ? 'Major' : null)
     }
   } catch (error) {
     console.error("Error parsing MIDI file:", error)

@@ -16,6 +16,7 @@ const MINOR_SCALE_SEMITONES = [0, 2, 3, 5, 7, 8, 10]
 // ─── Chord detection ──────────────────────────────────────────────────────────
 
 // Chord templates: intervals from root in semitones → suffix
+// Ordered: 4-note (7th) chords first, then added-note chords, then triads
 const CHORD_TEMPLATES = [
   { intervals: [0, 4, 7, 11], suffix: 'maj7', quality: 'major' },
   { intervals: [0, 4, 7, 10], suffix: '7', quality: 'major' },
@@ -24,6 +25,8 @@ const CHORD_TEMPLATES = [
   { intervals: [0, 3, 6, 9], suffix: 'o7', quality: 'diminished' },
   { intervals: [0, 4, 7, 9], suffix: '6', quality: 'major' },
   { intervals: [0, 3, 7, 9], suffix: 'm6', quality: 'minor' },
+  { intervals: [0, 2, 4, 7], suffix: 'add9', quality: 'major' },
+  { intervals: [0, 2, 3, 7], suffix: 'madd9', quality: 'minor' },
   { intervals: [0, 4, 8], suffix: '+', quality: 'augmented' },
   { intervals: [0, 3, 6], suffix: 'o', quality: 'diminished' },
   { intervals: [0, 5, 7], suffix: 'sus4', quality: 'suspended' },
@@ -46,14 +49,14 @@ function detectChord(pitchClasses, key, mode, bassPc) {
 
   for (const rootPc of pcs) {
     const intervals = pcs.map(pc => (pc - rootPc + 12) % 12).sort((a, b) => a - b)
+    const intervalSet = new Set(intervals)
 
     for (const template of CHORD_TEMPLATES) {
       if (intervals.length < template.intervals.length) continue
-      const templateSet = new Set(template.intervals)
-      let matchCount = 0
-      for (const iv of intervals) {
-        if (templateSet.has(iv)) matchCount++
-      }
+      // Require ALL template intervals to be present in the input
+      const allTemplatePresent = template.intervals.every(iv => intervalSet.has(iv))
+      if (!allTemplatePresent) continue
+      const matchCount = template.intervals.length
       const score = matchCount * 10 - (intervals.length - template.intervals.length)
       if (score > bestScore) {
         bestScore = score
@@ -115,6 +118,8 @@ function chordToRomanNumeral(chord, key, mode) {
   else if (chord.suffix === 'm7') extension = '7'
   else if (chord.suffix === '6') extension = '6'
   else if (chord.suffix === 'm6') extension = '6'
+  else if (chord.suffix === 'add9') extension = 'add9'
+  else if (chord.suffix === 'madd9') extension = 'madd9'
 
   return numeral + extension
 }
